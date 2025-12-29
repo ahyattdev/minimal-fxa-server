@@ -23,9 +23,14 @@ func main() {
 		baseURL = "http://localhost:" + port
 	}
 
+	syncServerURL := os.Getenv("SYNC_SERVER_URL")
+	if syncServerURL == "" {
+		syncServerURL = baseURL + "/token"
+	}
+
 	mux := http.NewServeMux()
 
-	autoconfigHandler := autoconfig.NewHandler(baseURL)
+	autoconfigHandler := autoconfig.NewHandler(baseURL, syncServerURL)
 	autoconfigHandler.RegisterRoutes(mux)
 
 	oauthHandler := oauth.NewHandler(baseURL, "username", "password")

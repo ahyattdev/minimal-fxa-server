@@ -17,13 +17,13 @@ type Handler struct {
 	Config ClientConfiguration
 }
 
-func NewHandler(baseURL string) *Handler {
+func NewHandler(baseURL, syncServerURL string) *Handler {
 	return &Handler{
 		Config: ClientConfiguration{
 			AuthServerBaseURL:    baseURL + "/auth",
 			OAuthServerBaseURL:   baseURL + "/oauth",
 			ProfileServerBaseURL: baseURL + "/profile",
-			TokenServerBaseURL:   baseURL + "/token",
+			TokenServerBaseURL:   syncServerURL,
 		},
 	}
 }
