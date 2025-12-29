@@ -11,6 +11,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /minimal-fxa-server .
 
 FROM gcr.io/distroless/static-debian13:nonroot
 
+LABEL org.opencontainers.image.source=https://github.com/ahyattdev/minimal-fxa-server
+
 COPY --from=builder /minimal-fxa-server /minimal-fxa-server
 
 EXPOSE 80
