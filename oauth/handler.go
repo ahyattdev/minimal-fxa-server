@@ -61,9 +61,6 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 
 	// Profile server endpoints
 	mux.HandleFunc("GET /profile/v1/profile", h.handleProfile)
-
-	// Token server endpoint (for Sync)
-	mux.HandleFunc("GET /token/1.0/sync/1.5", h.handleTokenServer)
 }
 
 func (h *Handler) handleAuthorizePage(w http.ResponseWriter, r *http.Request) {
@@ -406,48 +403,6 @@ func (h *Handler) handleProfile(w http.ResponseWriter, r *http.Request) {
 		"avatarDefault":           true,
 		"amrValues":               []string{"pwd"},
 		"twoFactorAuthentication": false,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
-}
-
-func (h *Handler) handleTokenServer(w http.ResponseWriter, r *http.Request) {
-	// Validate Authorization header
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
-		slog.Warn("Token server request missing authorization")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{"error": "invalid-credentials"})
-		return
-	}
-
-	// In a real implementation, we'd validate the access token here
-	// For now, we just accept any Bearer token
-
-	slog.Info("Token server request")
-
-	// Generate consistent UID based on username
-	uid := fmt.Sprintf("%x", sha256.Sum256([]byte(h.username)))[:32]
-	hashedUID := fmt.Sprintf("%x", sha256.Sum256([]byte(uid)))[:32]
-
-	// Generate token credentials
-	tokenID := generateRandomString(32)
-	tokenKey := generateRandomString(32)
-
-	// The api_endpoint should point to a Sync storage server
-	// For now, point to ourselves (would need a storage implementation)
-	apiEndpoint := h.baseURL + "/storage/1.5/" + uid
-
-	response := map[string]any{
-		"id":             tokenID,
-		"key":            tokenKey,
-		"api_endpoint":   apiEndpoint,
-		"uid":            uid,
-		"duration":       3600,
-		"hashed_fxa_uid": hashedUID,
-		"node_type":      "spanner",
 	}
 
 	w.Header().Set("Content-Type", "application/json")
