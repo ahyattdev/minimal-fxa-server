@@ -18,4 +18,3 @@ COPY --from=builder /minimal-fxa-server /minimal-fxa-server
 EXPOSE 80
 
 ENTRYPOINT ["/minimal-fxa-server"]
-

@@ -110,22 +110,6 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	h.authCodesMu.Unlock()
 
-	// Generate consistent UID and session token
-	uid := fmt.Sprintf("%x", sha256.Sum256([]byte(h.username)))[:32]
-	sessionToken := generateHexString(64)
-
-	// Prepare login data (for fxaccounts:login)
-	loginData := map[string]any{
-		"uid":          uid,
-		"email":        h.username + "@localhost",
-		"sessionToken": sessionToken,
-		"verified":     true,
-		"services": map[string]any{
-			"sync": map[string]string{},
-		},
-	}
-	loginJSON, _ := json.Marshal(loginData)
-
 	// Prepare OAuth data (for fxaccounts:oauth_login)
 	oauthData := map[string]any{
 		"code":  code,
@@ -142,8 +126,6 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 <script>
 (function() {
   const status = document.getElementById('status');
-  
-  const loginData = ` + string(loginJSON) + `;
   const oauthData = ` + string(oauthJSON) + `;
   
   function sendWebChannel(command, payload, messageId) {
@@ -180,19 +162,12 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
     }
   });
   
-  status.textContent = 'Setting up account...';
+  status.textContent = 'Completing sign-in...';
   
-  // Step 1: Send fxaccounts:login to set up the account
-  sendWebChannel('fxaccounts:login', loginData);
-  console.log('[FxA] Login sent with data:', loginData);
-  
-  // Step 2: Send fxaccounts:oauth_login to complete OAuth flow
-  setTimeout(function() {
-    status.textContent = 'Completing OAuth flow...';
-    sendWebChannel('fxaccounts:oauth_login', oauthData);
-    console.log('[FxA] OAuth login sent with data:', oauthData);
-    status.textContent = 'Sign-in complete! You can close this tab.';
-  }, 500);
+  // Send fxaccounts:oauth_login to complete OAuth flow
+  sendWebChannel('fxaccounts:oauth_login', oauthData);
+  console.log('[FxA] OAuth login sent with data:', oauthData);
+  status.textContent = 'Sign-in complete! You can close this tab.';
 })();
 </script>
 </body>
