@@ -4,18 +4,21 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
+	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/ahyattdev/minimal-fxa-server/database"
+	"github.com/golang-jwt/jwt/v5"
 	"gorm.io/gorm"
 )
 
@@ -24,15 +27,24 @@ type Handler struct {
 	username      string
 	password      string
 	db            *gorm.DB
+	privateKey    *ecdsa.PrivateKey
+	keyID         string
 	loginTemplate *template.Template
 }
 
-func NewHandler(baseURL, username, password string, db *gorm.DB) *Handler {
+func NewHandler(baseURL, username, password string, db *gorm.DB, privateKey *ecdsa.PrivateKey) *Handler {
+	// Generate a key ID from the public key
+	pubKeyBytes := append(privateKey.PublicKey.X.Bytes(), privateKey.PublicKey.Y.Bytes()...)
+	keyIDHash := sha256.Sum256(pubKeyBytes)
+	keyID := base64.RawURLEncoding.EncodeToString(keyIDHash[:8])
+
 	return &Handler{
 		baseURL:       baseURL,
 		username:      username,
 		password:      password,
 		db:            db,
+		privateKey:    privateKey,
+		keyID:         keyID,
 		loginTemplate: template.Must(template.New("login").Parse(loginHTML)),
 	}
 }
@@ -41,6 +53,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /{$}", h.handleAuthorizePage)
 	mux.HandleFunc("POST /{$}", h.handleLogin)
 	mux.HandleFunc("POST /oauth/v1/token", h.handleToken)
+	mux.HandleFunc("POST /oauth/v1/verify", h.handleVerify)
+	mux.HandleFunc("GET /oauth/v1/jwks", h.handleJWKS)
 
 	// Auth server endpoints
 	mux.HandleFunc("POST /auth/v1/oauth/token", h.handleAuthToken)
@@ -184,8 +198,9 @@ func (h *Handler) handleToken(w http.ResponseWriter, r *http.Request) {
 
 	var authCode database.AuthCode
 	var oauthToken *database.OAuthToken
-	accessToken := generateRandomString(64)
 	refreshToken := generateRandomString(64)
+	scope := "https://identity.mozilla.com/apps/oldsync profile"
+	expiresAt := time.Now().Add(time.Hour)
 
 	// Use transaction to atomically consume auth code and create token
 	err := h.db.Transaction(func(tx *gorm.DB) error {
@@ -200,15 +215,21 @@ func (h *Handler) handleToken(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 
+		// Generate JWT access token
+		accessToken, err := h.generateAccessToken(authCode.UserID, authCode.ClientID, scope, expiresAt)
+		if err != nil {
+			return fmt.Errorf("failed to generate access token: %w", err)
+		}
+
 		// Create the OAuth token
 		oauthToken = &database.OAuthToken{
 			AccessToken:  accessToken,
 			RefreshToken: refreshToken,
 			UserID:       authCode.UserID,
 			ClientID:     authCode.ClientID,
-			Scope:        "https://identity.mozilla.com/apps/oldsync profile",
+			Scope:        scope,
 			CreatedAt:    time.Now(),
-			ExpiresAt:    time.Now().Add(time.Hour),
+			ExpiresAt:    expiresAt,
 		}
 		if err := tx.Create(oauthToken).Error; err != nil {
 			return err
@@ -226,11 +247,11 @@ func (h *Handler) handleToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := map[string]any{
-		"access_token":  accessToken,
+		"access_token":  oauthToken.AccessToken,
 		"token_type":    "bearer",
 		"expires_in":    3600,
-		"refresh_token": refreshToken,
-		"scope":         "https://identity.mozilla.com/apps/oldsync profile",
+		"refresh_token": oauthToken.RefreshToken,
+		"scope":         oauthToken.Scope,
 	}
 
 	// Generate keys_jwe if keys_jwk was provided
@@ -244,14 +265,179 @@ func (h *Handler) handleToken(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	slog.Info("Token issued", "client_id", authCode.ClientID)
+	slog.Info("Token issued (JWT)", "client_id", oauthToken.ClientID)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
 
+func (h *Handler) handleVerify(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Token string `json:"token"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		slog.Warn("Failed to decode verify request", "error", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "invalid_request"})
+		return
+	}
+
+	slog.Info("Token verify request", "has_token", req.Token != "")
+
+	if req.Token == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "invalid_request"})
+		return
+	}
+
+	// Try to verify as JWT first (cryptographically secure)
+	claims, err := h.verifyAccessToken(req.Token)
+	if err == nil {
+		// JWT verified successfully
+		userID, _ := claims["sub"].(string)
+		clientID, _ := claims["client_id"].(string)
+		scope, _ := claims["scope"].(string)
+		exp, _ := claims["exp"].(float64)
+		generation, _ := claims["fxa-generation"].(float64)
+
+		expiresIn := int(exp - float64(time.Now().Unix()))
+		if expiresIn < 0 {
+			slog.Warn("JWT token expired")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid_token"})
+			return
+		}
+
+		response := map[string]any{
+			"user":       userID,
+			"client_id":  clientID,
+			"scope":      strings.Split(scope, " "),
+			"generation": int64(generation),
+		}
+
+		slog.Info("JWT token verified", "user", userID, "scope", scope)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	slog.Info("JWT verification failed, trying database lookup", "error", err)
+
+	// Fallback: Look up the token in database (for legacy opaque tokens)
+	var oauthToken database.OAuthToken
+	if err := h.db.Where("access_token = ?", req.Token).First(&oauthToken).Error; err != nil {
+		slog.Warn("Token not found for verify", "error", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "invalid_token"})
+		return
+	}
+
+	// Check if token is expired
+	if time.Now().After(oauthToken.ExpiresAt) {
+		slog.Warn("Token expired")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "invalid_token"})
+		return
+	}
+
+	// Return token info
+	response := map[string]any{
+		"user":       oauthToken.UserID,
+		"client_id":  oauthToken.ClientID,
+		"scope":      strings.Split(oauthToken.Scope, " "),
+		"generation": oauthToken.CreatedAt.Unix(),
+	}
+
+	slog.Info("Token verified via database", "user", oauthToken.UserID, "scope", oauthToken.Scope)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func (h *Handler) handleJWKS(w http.ResponseWriter, r *http.Request) {
+	slog.Info("JWKS request")
+
+	// Return the public key in JWK format
+	pubKey := &h.privateKey.PublicKey
+
+	// Pad coordinates to 32 bytes for P-256
+	xBytes := pubKey.X.Bytes()
+	yBytes := pubKey.Y.Bytes()
+	if len(xBytes) < 32 {
+		xBytes = append(make([]byte, 32-len(xBytes)), xBytes...)
+	}
+	if len(yBytes) < 32 {
+		yBytes = append(make([]byte, 32-len(yBytes)), yBytes...)
+	}
+
+	jwk := map[string]any{
+		"kty": "EC",
+		"crv": "P-256",
+		"x":   base64.RawURLEncoding.EncodeToString(xBytes),
+		"y":   base64.RawURLEncoding.EncodeToString(yBytes),
+		"kid": h.keyID,
+		"use": "sig",
+		"alg": "ES256",
+	}
+
+	response := map[string]any{
+		"keys": []any{jwk},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// generateAccessToken creates a signed JWT access token
+func (h *Handler) generateAccessToken(userID, clientID, scope string, expiresAt time.Time) (string, error) {
+	claims := jwt.MapClaims{
+		"sub":            userID,
+		"client_id":      clientID,
+		"scope":          scope,
+		"iat":            time.Now().Unix(),
+		"exp":            expiresAt.Unix(),
+		"fxa-generation": time.Now().Unix(), // Required by syncstorage-rs
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+	token.Header["kid"] = h.keyID
+
+	return token.SignedString(h.privateKey)
+}
+
+// verifyAccessToken validates a JWT and returns its claims
+func (h *Handler) verifyAccessToken(tokenString string) (jwt.MapClaims, error) {
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodECDSA); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return &h.privateKey.PublicKey, nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+		return claims, nil
+	}
+
+	return nil, fmt.Errorf("invalid token")
+}
+
 func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 	// Firefox sends JSON body for token requests
+	// First, read and log the raw body for debugging
+	bodyBytes, _ := io.ReadAll(r.Body)
+	slog.Info("Raw token request body", "body", string(bodyBytes), "length", len(bodyBytes))
+
 	var req struct {
 		Code         string `json:"code"`
 		ClientID     string `json:"client_id"`
@@ -259,18 +445,78 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 		GrantType    string `json:"grant_type"`
 		RefreshToken string `json:"refresh_token"`
 		Scope        string `json:"scope"`
+		TTL          int    `json:"ttl"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		slog.Warn("Failed to decode token request", "error", err)
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
 
-	slog.Info("Token exchange request", "grant_type", req.GrantType, "client_id", req.ClientID)
+	slog.Info("Token exchange request",
+		"grant_type", req.GrantType,
+		"client_id", req.ClientID,
+		"has_code", req.Code != "",
+		"has_refresh_token", req.RefreshToken != "",
+		"scope", req.Scope)
 
-	// Handle refresh token grant
-	if req.GrantType == "refresh_token" {
+	// Handle fxa-credentials grant type (Mozilla-specific)
+	// Firefox uses this to get access tokens using session credentials
+	if req.GrantType == "fxa-credentials" {
+		userID := fmt.Sprintf("%x", sha256.Sum256([]byte(h.username)))[:32]
+
+		scope := req.Scope
+		if scope == "" {
+			scope = "profile"
+		}
+
+		ttl := req.TTL
+		if ttl <= 0 {
+			ttl = 3600
+		}
+
+		expiresAt := time.Now().Add(time.Duration(ttl) * time.Second)
+
+		// Generate JWT access token
+		accessToken, err := h.generateAccessToken(userID, req.ClientID, scope, expiresAt)
+		if err != nil {
+			slog.Error("Failed to generate JWT for fxa-credentials", "error", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		// Store the token in database
+		oauthToken := &database.OAuthToken{
+			AccessToken:  accessToken,
+			RefreshToken: generateRandomString(64), // Generate one for potential future use
+			UserID:       userID,
+			ClientID:     req.ClientID,
+			Scope:        scope,
+			CreatedAt:    time.Now(),
+			ExpiresAt:    expiresAt,
+		}
+		if err := h.db.Create(oauthToken).Error; err != nil {
+			slog.Error("Failed to create token for fxa-credentials", "error", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		response := map[string]any{
+			"access_token": accessToken,
+			"token_type":   "bearer",
+			"expires_in":   ttl,
+			"scope":        scope,
+		}
+
+		slog.Info("Issued fxa-credentials token (JWT)", "scope", scope, "ttl", ttl)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	// Handle refresh token grant - check both grant_type and presence of refresh_token
+	if req.GrantType == "refresh_token" || (req.RefreshToken != "" && req.Code == "") {
 		if req.RefreshToken == "" {
 			slog.Warn("Empty refresh_token in token request")
 			w.Header().Set("Content-Type", "application/json")
@@ -279,8 +525,11 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		newAccessToken := generateRandomString(64)
+		slog.Info("Processing refresh token request")
+
+		var newAccessToken string
 		var scope string
+		expiresAt := time.Now().Add(time.Hour)
 
 		// Use transaction to atomically update the token
 		err := h.db.Transaction(func(tx *gorm.DB) error {
@@ -294,8 +543,15 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 				scope = existingToken.Scope
 			}
 
+			// Generate JWT access token
+			var err error
+			newAccessToken, err = h.generateAccessToken(existingToken.UserID, existingToken.ClientID, scope, expiresAt)
+			if err != nil {
+				return fmt.Errorf("failed to generate access token: %w", err)
+			}
+
 			existingToken.AccessToken = newAccessToken
-			existingToken.ExpiresAt = time.Now().Add(time.Hour)
+			existingToken.ExpiresAt = expiresAt
 			return tx.Save(&existingToken).Error
 		})
 
@@ -314,7 +570,7 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 			"scope":        scope,
 		}
 
-		slog.Info("Token refreshed", "scope", scope)
+		slog.Info("Token refreshed (JWT)", "scope", scope)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(response)
 		return
@@ -330,8 +586,10 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var authCode database.AuthCode
-	accessToken := generateRandomString(64)
+	var oauthToken *database.OAuthToken
 	refreshToken := generateRandomString(64)
+	scope := "https://identity.mozilla.com/apps/oldsync profile"
+	expiresAt := time.Now().Add(time.Hour)
 
 	// Use transaction to atomically consume auth code and create token
 	err := h.db.Transaction(func(tx *gorm.DB) error {
@@ -345,15 +603,21 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 
+		// Generate JWT access token
+		accessToken, err := h.generateAccessToken(authCode.UserID, authCode.ClientID, scope, expiresAt)
+		if err != nil {
+			return fmt.Errorf("failed to generate access token: %w", err)
+		}
+
 		// Create the OAuth token
-		oauthToken := &database.OAuthToken{
+		oauthToken = &database.OAuthToken{
 			AccessToken:  accessToken,
 			RefreshToken: refreshToken,
 			UserID:       authCode.UserID,
 			ClientID:     authCode.ClientID,
-			Scope:        "https://identity.mozilla.com/apps/oldsync profile",
+			Scope:        scope,
 			CreatedAt:    time.Now(),
-			ExpiresAt:    time.Now().Add(time.Hour),
+			ExpiresAt:    expiresAt,
 		}
 		return tx.Create(oauthToken).Error
 	})
@@ -367,11 +631,11 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := map[string]any{
-		"access_token":  accessToken,
-		"refresh_token": refreshToken,
+		"access_token":  oauthToken.AccessToken,
+		"refresh_token": oauthToken.RefreshToken,
 		"token_type":    "bearer",
 		"expires_in":    3600,
-		"scope":         "https://identity.mozilla.com/apps/oldsync profile",
+		"scope":         oauthToken.Scope,
 	}
 
 	// Generate keys_jwe if keys_jwk was provided
@@ -385,7 +649,7 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	slog.Info("Token issued successfully")
+	slog.Info("Token issued (JWT)", "client_id", oauthToken.ClientID)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
