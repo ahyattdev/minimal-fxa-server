@@ -13,35 +13,26 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/ahyattdev/minimal-fxa-server/database"
+	"gorm.io/gorm"
 )
 
 type Handler struct {
 	baseURL       string
 	username      string
 	password      string
-	authCodes     map[string]*AuthCode
-	authCodesMu   sync.RWMutex
+	db            *gorm.DB
 	loginTemplate *template.Template
 }
 
-type AuthCode struct {
-	Code                string
-	ClientID            string
-	CodeChallenge       string
-	CodeChallengeMethod string
-	State               string
-	KeysJWK             string
-	CreatedAt           time.Time
-}
-
-func NewHandler(baseURL, username, password string) *Handler {
+func NewHandler(baseURL, username, password string, db *gorm.DB) *Handler {
 	return &Handler{
 		baseURL:       baseURL,
 		username:      username,
 		password:      password,
-		authCodes:     make(map[string]*AuthCode),
+		db:            db,
 		loginTemplate: template.Must(template.New("login").Parse(loginHTML)),
 	}
 }
@@ -54,6 +45,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	// Auth server endpoints
 	mux.HandleFunc("POST /auth/v1/oauth/token", h.handleAuthToken)
 	mux.HandleFunc("POST /auth/v1/account/device", h.handleDevice)
+	mux.HandleFunc("GET /auth/v1/account/devices", h.handleDevices)
+	mux.HandleFunc("GET /auth/v1/account/attached_clients", h.handleAttachedClients)
 	mux.HandleFunc("GET /auth/v1/recovery_email/status", h.handleRecoveryEmailStatus)
 	mux.HandleFunc("POST /auth/v1/account/keys", h.handleAccountKeys)
 	mux.HandleFunc("POST /auth/v1/session/destroy", h.handleSessionDestroy)
@@ -94,21 +87,27 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// Generate OAuth authorization code
 	code := generateHexString(64)
 	state := r.FormValue("state")
+	userID := fmt.Sprintf("%x", sha256.Sum256([]byte(h.username)))[:32]
 
 	slog.Info("User authenticated, generated auth code", "username", username)
 
-	// Store the auth code for token exchange
-	h.authCodesMu.Lock()
-	h.authCodes[code] = &AuthCode{
+	// Store the auth code in database
+	authCode := &database.AuthCode{
 		Code:                code,
 		ClientID:            r.FormValue("client_id"),
 		CodeChallenge:       r.FormValue("code_challenge"),
 		CodeChallengeMethod: r.FormValue("code_challenge_method"),
 		State:               state,
 		KeysJWK:             r.FormValue("keys_jwk"),
+		UserID:              userID,
 		CreatedAt:           time.Now(),
+		ExpiresAt:           time.Now().Add(10 * time.Minute),
 	}
-	h.authCodesMu.Unlock()
+	if err := h.db.Create(authCode).Error; err != nil {
+		slog.Error("Failed to store auth code", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 
 	// Prepare OAuth data (for fxaccounts:oauth_login)
 	oauthData := map[string]any{
@@ -183,29 +182,48 @@ func (h *Handler) handleToken(w http.ResponseWriter, r *http.Request) {
 
 	code := r.FormValue("code")
 
-	h.authCodesMu.RLock()
-	authCode, exists := h.authCodes[code]
-	h.authCodesMu.RUnlock()
+	var authCode database.AuthCode
+	var oauthToken *database.OAuthToken
+	accessToken := generateRandomString(64)
+	refreshToken := generateRandomString(64)
 
-	if !exists {
-		slog.Warn("Invalid auth code", "code", code)
+	// Use transaction to atomically consume auth code and create token
+	err := h.db.Transaction(func(tx *gorm.DB) error {
+		// Find and lock the auth code
+		result := tx.Where("code = ? AND expires_at > ?", code, time.Now()).First(&authCode)
+		if result.Error != nil {
+			return result.Error
+		}
+
+		// Delete the auth code immediately to prevent reuse
+		if err := tx.Delete(&authCode).Error; err != nil {
+			return err
+		}
+
+		// Create the OAuth token
+		oauthToken = &database.OAuthToken{
+			AccessToken:  accessToken,
+			RefreshToken: refreshToken,
+			UserID:       authCode.UserID,
+			ClientID:     authCode.ClientID,
+			Scope:        "https://identity.mozilla.com/apps/oldsync profile",
+			CreatedAt:    time.Now(),
+			ExpiresAt:    time.Now().Add(time.Hour),
+		}
+		if err := tx.Create(oauthToken).Error; err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		slog.Warn("Token exchange failed", "code", code, "error", err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "invalid_grant"})
 		return
 	}
-
-	// Get KeysJWK before deleting
-	keysJWK := authCode.KeysJWK
-
-	// TODO: Verify code_verifier against code_challenge (PKCE)
-
-	h.authCodesMu.Lock()
-	delete(h.authCodes, code)
-	h.authCodesMu.Unlock()
-
-	accessToken := generateRandomString(64)
-	refreshToken := generateRandomString(64)
 
 	response := map[string]any{
 		"access_token":  accessToken,
@@ -216,8 +234,8 @@ func (h *Handler) handleToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Generate keys_jwe if keys_jwk was provided
-	if keysJWK != "" {
-		keysJWE, err := generateScopedKeysJWE(keysJWK)
+	if authCode.KeysJWK != "" {
+		keysJWE, err := generateScopedKeysJWE(authCode.KeysJWK)
 		if err != nil {
 			slog.Warn("Failed to generate keys_jwe", "error", err)
 		} else {
@@ -239,6 +257,8 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 		ClientID     string `json:"client_id"`
 		CodeVerifier string `json:"code_verifier"`
 		GrantType    string `json:"grant_type"`
+		RefreshToken string `json:"refresh_token"`
+		Scope        string `json:"scope"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -249,6 +269,58 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("Token exchange request", "grant_type", req.GrantType, "client_id", req.ClientID)
 
+	// Handle refresh token grant
+	if req.GrantType == "refresh_token" {
+		if req.RefreshToken == "" {
+			slog.Warn("Empty refresh_token in token request")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid_request"})
+			return
+		}
+
+		newAccessToken := generateRandomString(64)
+		var scope string
+
+		// Use transaction to atomically update the token
+		err := h.db.Transaction(func(tx *gorm.DB) error {
+			var existingToken database.OAuthToken
+			if err := tx.Where("refresh_token = ?", req.RefreshToken).First(&existingToken).Error; err != nil {
+				return err
+			}
+
+			scope = req.Scope
+			if scope == "" {
+				scope = existingToken.Scope
+			}
+
+			existingToken.AccessToken = newAccessToken
+			existingToken.ExpiresAt = time.Now().Add(time.Hour)
+			return tx.Save(&existingToken).Error
+		})
+
+		if err != nil {
+			slog.Warn("Token refresh failed", "error", err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid_grant"})
+			return
+		}
+
+		response := map[string]any{
+			"access_token": newAccessToken,
+			"token_type":   "bearer",
+			"expires_in":   3600,
+			"scope":        scope,
+		}
+
+		slog.Info("Token refreshed", "scope", scope)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	// Handle authorization code grant
 	if req.Code == "" {
 		slog.Warn("Empty code in token request")
 		w.Header().Set("Content-Type", "application/json")
@@ -257,27 +329,42 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.authCodesMu.RLock()
-	authCode, exists := h.authCodes[req.Code]
-	h.authCodesMu.RUnlock()
+	var authCode database.AuthCode
+	accessToken := generateRandomString(64)
+	refreshToken := generateRandomString(64)
 
-	if !exists {
-		slog.Warn("Invalid auth code in auth token endpoint")
+	// Use transaction to atomically consume auth code and create token
+	err := h.db.Transaction(func(tx *gorm.DB) error {
+		// Find and lock the auth code
+		if err := tx.Where("code = ? AND expires_at > ?", req.Code, time.Now()).First(&authCode).Error; err != nil {
+			return err
+		}
+
+		// Delete the auth code immediately to prevent reuse
+		if err := tx.Delete(&authCode).Error; err != nil {
+			return err
+		}
+
+		// Create the OAuth token
+		oauthToken := &database.OAuthToken{
+			AccessToken:  accessToken,
+			RefreshToken: refreshToken,
+			UserID:       authCode.UserID,
+			ClientID:     authCode.ClientID,
+			Scope:        "https://identity.mozilla.com/apps/oldsync profile",
+			CreatedAt:    time.Now(),
+			ExpiresAt:    time.Now().Add(time.Hour),
+		}
+		return tx.Create(oauthToken).Error
+	})
+
+	if err != nil {
+		slog.Warn("Token exchange failed", "code", req.Code, "error", err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "invalid_grant"})
 		return
 	}
-
-	// Get KeysJWK before deleting
-	keysJWK := authCode.KeysJWK
-
-	h.authCodesMu.Lock()
-	delete(h.authCodes, req.Code)
-	h.authCodesMu.Unlock()
-
-	accessToken := generateRandomString(64)
-	refreshToken := generateRandomString(64)
 
 	response := map[string]any{
 		"access_token":  accessToken,
@@ -288,8 +375,8 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Generate keys_jwe if keys_jwk was provided
-	if keysJWK != "" {
-		keysJWE, err := generateScopedKeysJWE(keysJWK)
+	if authCode.KeysJWK != "" {
+		keysJWE, err := generateScopedKeysJWE(authCode.KeysJWK)
 		if err != nil {
 			slog.Warn("Failed to generate keys_jwe", "error", err)
 		} else {
@@ -306,20 +393,165 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleDevice(w http.ResponseWriter, r *http.Request) {
 	slog.Info("Device registration request")
 
+	userID := fmt.Sprintf("%x", sha256.Sum256([]byte(h.username)))[:32]
+
+	// Get access token from Authorization header
+	var accessToken string
+	if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+		accessToken = strings.TrimPrefix(authHeader, "Bearer ")
+	}
+
+	// Parse request body for device info
+	var req struct {
+		Name          string  `json:"name"`
+		Type          string  `json:"type"`
+		PushCallback  *string `json:"pushCallback"`
+		PushPublicKey *string `json:"pushPublicKey"`
+		PushAuthKey   *string `json:"pushAuthKey"`
+	}
+	// Ignore decode errors - use defaults if body is empty/invalid
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	if req.Name == "" {
+		req.Name = "Firefox"
+	}
+	if req.Type == "" {
+		req.Type = "desktop"
+	}
+
 	deviceID := generateRandomString(32)
+
+	// Store device and link to OAuth token in a transaction
+	device := &database.Device{
+		ID:            deviceID,
+		UserID:        userID,
+		Name:          req.Name,
+		Type:          req.Type,
+		PushCallback:  req.PushCallback,
+		PushPublicKey: req.PushPublicKey,
+		PushAuthKey:   req.PushAuthKey,
+		CreatedAt:     time.Now(),
+		LastAccessAt:  time.Now(),
+	}
+
+	err := h.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(device).Error; err != nil {
+			return err
+		}
+
+		// Link device to the OAuth token used for this request
+		if accessToken != "" {
+			if err := tx.Model(&database.OAuthToken{}).
+				Where("access_token = ?", accessToken).
+				Update("device_id", deviceID).Error; err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		slog.Error("Failed to create device", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 
 	response := map[string]any{
 		"id":            deviceID,
-		"name":          "Firefox",
-		"type":          "desktop",
-		"pushCallback":  nil,
-		"pushPublicKey": nil,
-		"pushAuthKey":   nil,
-		"createdAt":     time.Now().UnixMilli(),
+		"name":          device.Name,
+		"type":          device.Type,
+		"pushCallback":  device.PushCallback,
+		"pushPublicKey": device.PushPublicKey,
+		"pushAuthKey":   device.PushAuthKey,
+		"createdAt":     device.CreatedAt.UnixMilli(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+func (h *Handler) handleDevices(w http.ResponseWriter, r *http.Request) {
+	slog.Info("Device list request")
+
+	userID := fmt.Sprintf("%x", sha256.Sum256([]byte(h.username)))[:32]
+
+	// Find current device from the access token
+	var currentDeviceID string
+	if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+		accessToken := strings.TrimPrefix(authHeader, "Bearer ")
+		var token database.OAuthToken
+		if err := h.db.Where("access_token = ?", accessToken).First(&token).Error; err == nil && token.DeviceID != nil {
+			currentDeviceID = *token.DeviceID
+		}
+	}
+
+	// Get devices from database
+	var devices []database.Device
+	if err := h.db.Where("user_id = ?", userID).Find(&devices).Error; err != nil {
+		slog.Error("Failed to fetch devices", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Convert to response format
+	result := make([]map[string]any, len(devices))
+	for i, device := range devices {
+		result[i] = map[string]any{
+			"id":              device.ID,
+			"name":            device.Name,
+			"type":            device.Type,
+			"isCurrentDevice": device.ID == currentDeviceID,
+			"pushCallback":    device.PushCallback,
+			"pushPublicKey":   device.PushPublicKey,
+			"pushAuthKey":     device.PushAuthKey,
+			"createdAt":       device.CreatedAt.UnixMilli(),
+			"lastAccessTime":  device.LastAccessAt.UnixMilli(),
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+func (h *Handler) handleAttachedClients(w http.ResponseWriter, r *http.Request) {
+	slog.Info("Attached clients request")
+
+	userID := fmt.Sprintf("%x", sha256.Sum256([]byte(h.username)))[:32]
+
+	// Extract current access token from Authorization header
+	var currentAccessToken string
+	if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+		currentAccessToken = strings.TrimPrefix(authHeader, "Bearer ")
+	}
+
+	// Get OAuth tokens from database
+	var tokens []database.OAuthToken
+	if err := h.db.Where("user_id = ?", userID).Find(&tokens).Error; err != nil {
+		slog.Error("Failed to fetch attached clients", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Convert to response format
+	clients := make([]map[string]any, len(tokens))
+	for i, token := range tokens {
+		clients[i] = map[string]any{
+			"clientId":         token.ClientID,
+			"deviceId":         token.DeviceID,
+			"sessionTokenId":   nil,
+			"refreshTokenId":   fmt.Sprintf("%d", token.ID),
+			"isCurrentSession": token.AccessToken == currentAccessToken,
+			"deviceType":       "desktop",
+			"name":             "Firefox",
+			"createdTime":      token.CreatedAt.UnixMilli(),
+			"lastAccessTime":   token.ExpiresAt.UnixMilli(),
+			"scope":            strings.Split(token.Scope, " "),
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(clients)
 }
 
 func (h *Handler) handleRecoveryEmailStatus(w http.ResponseWriter, r *http.Request) {

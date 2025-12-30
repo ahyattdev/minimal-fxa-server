@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/ahyattdev/minimal-fxa-server/autoconfig"
+	"github.com/ahyattdev/minimal-fxa-server/database"
 	"github.com/ahyattdev/minimal-fxa-server/oauth"
 )
 
@@ -28,12 +29,24 @@ func main() {
 		syncServerURL = baseURL + "/token"
 	}
 
+	databaseURI := os.Getenv("DATABASE_URI")
+	if databaseURI == "" {
+		slog.Error("DATABASE_URI environment variable is required")
+		os.Exit(1)
+	}
+
+	db, err := database.Connect(databaseURI)
+	if err != nil {
+		slog.Error("Failed to connect to database", "error", err)
+		os.Exit(1)
+	}
+
 	mux := http.NewServeMux()
 
 	autoconfigHandler := autoconfig.NewHandler(baseURL, syncServerURL)
 	autoconfigHandler.RegisterRoutes(mux)
 
-	oauthHandler := oauth.NewHandler(baseURL, "username", "password")
+	oauthHandler := oauth.NewHandler(baseURL, "username", "password", db)
 	oauthHandler.RegisterRoutes(mux)
 
 	mux.HandleFunc("/{path...}", func(w http.ResponseWriter, r *http.Request) {
