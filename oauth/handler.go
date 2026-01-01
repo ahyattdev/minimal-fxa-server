@@ -1050,7 +1050,8 @@ func generateScopedKeysJWE(keysJWKBase64 string) (string, error) {
 	derivedKey := derivedKeyHash[:32]
 
 	// Generate random sync key for the scoped keys
-	syncKey := make([]byte, 32)
+	// Must be 64 bytes: first 32 for encryption, last 32 for HMAC
+	syncKey := make([]byte, 64)
 	rand.Read(syncKey)
 
 	// Generate key fingerprint (random bytes, base64url encoded)
