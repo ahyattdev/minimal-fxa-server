@@ -69,6 +69,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /auth/v1/account/device", h.handleDevice)
 	mux.HandleFunc("GET /auth/v1/account/devices", h.handleDevices)
 	mux.HandleFunc("POST /auth/v1/account/devices/notify", h.handleDevicesNotify)
+	mux.HandleFunc("GET /auth/v1/account/device/commands", h.handleDeviceCommands)
 	mux.HandleFunc("GET /auth/v1/account/attached_clients", h.handleAttachedClients)
 	mux.HandleFunc("GET /auth/v1/recovery_email/status", h.handleRecoveryEmailStatus)
 	mux.HandleFunc("POST /auth/v1/account/keys", h.handleAccountKeys)
@@ -493,6 +494,9 @@ func (h *Handler) getOrCreateUser(tx *gorm.DB, userID string) (int64, error) {
 
 // generateAccessToken creates a signed JWT access token
 func (h *Handler) generateAccessToken(userID, clientID, scope string, expiresAt time.Time, keysChangedAt int64) (string, error) {
+	// Generate a unique JWT ID to prevent duplicate tokens
+	jti := generateRandomString(16)
+
 	claims := jwt.MapClaims{
 		"iss":            h.baseURL, // Issuer - required for JWT verification
 		"sub":            userID,
@@ -501,6 +505,7 @@ func (h *Handler) generateAccessToken(userID, clientID, scope string, expiresAt 
 		"scope":          scope,
 		"iat":            time.Now().Unix(),
 		"exp":            expiresAt.Unix(),
+		"jti":            jti,           // Unique token ID to prevent duplicates
 		"fxa-generation": keysChangedAt, // Must be stable per user for syncstorage-rs
 	}
 
@@ -889,6 +894,21 @@ func (h *Handler) handleDevices(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
+}
+
+func (h *Handler) handleDeviceCommands(w http.ResponseWriter, r *http.Request) {
+	slog.Info("Device commands request")
+
+	// Return empty commands list - we don't store commands server-side
+	// Commands are delivered via push notifications in real-time
+	response := map[string]any{
+		"index":    0,
+		"last":     true,
+		"messages": []any{},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 func (h *Handler) handleDevicesNotify(w http.ResponseWriter, r *http.Request) {
