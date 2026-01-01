@@ -59,9 +59,18 @@ type Session struct {
 
 // User represents a Firefox Account user
 type User struct {
-	ID            string `gorm:"primaryKey"` // MD5 hash of username
+	ID            string `gorm:"primaryKey"` // MD5 hash of username/email
 	KeysChangedAt int64  // Unix timestamp, set once on first login, used in JWT fxa-generation
 	CreatedAt     time.Time
+}
+
+// LocalUser represents a locally authenticated user with password
+type LocalUser struct {
+	ID           string `gorm:"primaryKey"` // Same as User.ID
+	Email        string `gorm:"uniqueIndex;not null"`
+	PasswordHash string `gorm:"not null"` // bcrypt hash
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 // Connect initializes the database connection and runs migrations
@@ -76,7 +85,7 @@ func Connect(databaseURI string) (*gorm.DB, error) {
 	slog.Info("Connected to database")
 
 	// Auto-migrate schemas
-	err = db.AutoMigrate(&Device{}, &AuthCode{}, &OAuthToken{}, &Session{}, &User{})
+	err = db.AutoMigrate(&Device{}, &AuthCode{}, &OAuthToken{}, &Session{}, &User{}, &LocalUser{})
 	if err != nil {
 		return nil, err
 	}

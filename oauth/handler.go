@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/SherClockHolmes/webpush-go"
+	"github.com/ahyattdev/minimal-fxa-server/auth"
 	"github.com/ahyattdev/minimal-fxa-server/database"
 	"github.com/golang-jwt/jwt/v5"
 	"gorm.io/gorm"
@@ -31,8 +32,7 @@ type VAPIDConfig struct {
 
 type Handler struct {
 	baseURL       string
-	username      string
-	password      string
+	authProvider  auth.Provider
 	db            *gorm.DB
 	privateKey    *rsa.PrivateKey
 	keyID         string
@@ -40,15 +40,14 @@ type Handler struct {
 	vapid         VAPIDConfig
 }
 
-func NewHandler(baseURL, username, password string, db *gorm.DB, privateKey *rsa.PrivateKey, vapid VAPIDConfig) *Handler {
+func NewHandler(baseURL string, authProvider auth.Provider, db *gorm.DB, privateKey *rsa.PrivateKey, vapid VAPIDConfig) *Handler {
 	// Generate a key ID from the public key modulus
 	keyIDHash := sha256.Sum256(privateKey.PublicKey.N.Bytes())
 	keyID := base64.RawURLEncoding.EncodeToString(keyIDHash[:8])
 
 	return &Handler{
 		baseURL:       baseURL,
-		username:      username,
-		password:      password,
+		authProvider:  authProvider,
 		db:            db,
 		privateKey:    privateKey,
 		keyID:         keyID,
@@ -99,11 +98,12 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	username := r.FormValue("username")
+	email := r.FormValue("email")
 	password := r.FormValue("password")
 
-	if username != h.username || password != h.password {
-		slog.Warn("Failed login attempt", "username", username)
+	user, err := h.authProvider.Authenticate(r.Context(), email, password)
+	if err != nil {
+		slog.Warn("Failed login attempt", "email", email, "error", err)
 		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 		return
 	}
@@ -111,9 +111,9 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// Generate OAuth authorization code
 	code := generateHexString(64)
 	state := r.FormValue("state")
-	userID := fmt.Sprintf("%x", sha256.Sum256([]byte(h.username)))[:32]
+	userID := user.ID
 
-	slog.Info("User authenticated, generated auth code", "username", username)
+	slog.Info("User authenticated, generated auth code", "email", email)
 
 	// Store the auth code in database
 	authCode := &database.AuthCode{
@@ -157,8 +157,8 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 		"redirect":            "web",
 		"action":              "signin",
 		"uid":                 userID,
-		"email":               h.username + "@localhost",
-		"verified":            true,
+		"email":               user.Email,
+		"verified":            user.Verified,
 		"sessionToken":        sessionToken,
 		"declinedSyncEngines": []string{},
 		"offeredSyncEngines":  []string{"bookmarks", "history", "passwords", "tabs", "addons", "preferences"},
@@ -168,9 +168,9 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// Prepare login data (for fxaccounts:login - sets up user in Firefox)
 	loginData := map[string]any{
 		"uid":          userID,
-		"email":        h.username + "@localhost",
+		"email":        user.Email,
 		"sessionToken": sessionToken,
-		"verified":     true,
+		"verified":     user.Verified,
 	}
 	loginJSON, _ := json.Marshal(loginData)
 
@@ -536,6 +536,43 @@ func (h *Handler) verifyAccessToken(tokenString string) (jwt.MapClaims, error) {
 	return nil, fmt.Errorf("invalid token")
 }
 
+// getUserFromRequest extracts user ID and email from the Authorization header
+func (h *Handler) getUserFromRequest(r *http.Request) (userID, email string, err error) {
+	authHeader := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		return "", "", fmt.Errorf("missing or invalid Authorization header")
+	}
+
+	accessToken := strings.TrimPrefix(authHeader, "Bearer ")
+
+	// Try JWT verification first
+	claims, err := h.verifyAccessToken(accessToken)
+	if err == nil {
+		userID, _ = claims["sub"].(string)
+		// Get email from database using user ID
+		var localUser database.LocalUser
+		if dbErr := h.db.Where("id = ?", userID).First(&localUser).Error; dbErr == nil {
+			return userID, localUser.Email, nil
+		}
+		// Fallback: construct email from user ID for OIDC users
+		return userID, userID + "@user", nil
+	}
+
+	// Fallback to database lookup for opaque tokens
+	var token database.OAuthToken
+	if err := h.db.Where("access_token = ?", accessToken).First(&token).Error; err != nil {
+		return "", "", fmt.Errorf("invalid token")
+	}
+
+	// Get email from LocalUser table
+	var localUser database.LocalUser
+	if dbErr := h.db.Where("id = ?", token.UserID).First(&localUser).Error; dbErr == nil {
+		return token.UserID, localUser.Email, nil
+	}
+
+	return token.UserID, token.UserID + "@user", nil
+}
+
 func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Code         string `json:"code"`
@@ -563,7 +600,14 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 	// Handle fxa-credentials grant type (Mozilla-specific)
 	// Firefox uses this to get access tokens using session credentials
 	if req.GrantType == "fxa-credentials" {
-		userID := fmt.Sprintf("%x", sha256.Sum256([]byte(h.username)))[:32]
+		userID, _, err := h.getUserFromRequest(r)
+		if err != nil {
+			slog.Warn("fxa-credentials: failed to get user from request", "error", err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+			return
+		}
 
 		scope := req.Scope
 		if scope == "" {
@@ -578,7 +622,7 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 		expiresAt := time.Now().Add(time.Duration(ttl) * time.Second)
 
 		var oauthToken *database.OAuthToken
-		err := h.db.Transaction(func(tx *gorm.DB) error {
+		err = h.db.Transaction(func(tx *gorm.DB) error {
 			// Get or create user to get stable keysChangedAt
 			keysChangedAt, err := h.getOrCreateUser(tx, userID)
 			if err != nil {
@@ -775,7 +819,12 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleDevice(w http.ResponseWriter, r *http.Request) {
 	slog.Info("Device registration request")
 
-	userID := fmt.Sprintf("%x", sha256.Sum256([]byte(h.username)))[:32]
+	userID, _, err := h.getUserFromRequest(r)
+	if err != nil {
+		slog.Warn("Device registration: failed to get user from request", "error", err)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 
 	// Get access token from Authorization header
 	var accessToken string
@@ -816,7 +865,7 @@ func (h *Handler) handleDevice(w http.ResponseWriter, r *http.Request) {
 		LastAccessAt:  time.Now(),
 	}
 
-	err := h.db.Transaction(func(tx *gorm.DB) error {
+	err = h.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(device).Error; err != nil {
 			return err
 		}
@@ -856,7 +905,12 @@ func (h *Handler) handleDevice(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleDevices(w http.ResponseWriter, r *http.Request) {
 	slog.Info("Device list request")
 
-	userID := fmt.Sprintf("%x", sha256.Sum256([]byte(h.username)))[:32]
+	userID, _, err := h.getUserFromRequest(r)
+	if err != nil {
+		slog.Warn("Device list: failed to get user from request", "error", err)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 
 	// Find current device from the access token
 	var currentDeviceID string
@@ -923,7 +977,12 @@ func (h *Handler) handleDevicesNotify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := fmt.Sprintf("%x", sha256.Sum256([]byte(h.username)))[:32]
+	userID, _, err := h.getUserFromRequest(r)
+	if err != nil {
+		slog.Warn("Device notify: failed to get user from request", "error", err)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 
 	// Parse request body
 	var req struct {
@@ -1047,7 +1106,12 @@ func (h *Handler) sendPushNotification(device database.Device, payload json.RawM
 func (h *Handler) handleAttachedClients(w http.ResponseWriter, r *http.Request) {
 	slog.Info("Attached clients request")
 
-	userID := fmt.Sprintf("%x", sha256.Sum256([]byte(h.username)))[:32]
+	userID, _, err := h.getUserFromRequest(r)
+	if err != nil {
+		slog.Warn("Attached clients: failed to get user from request", "error", err)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 
 	// Extract current access token from Authorization header
 	var currentAccessToken string
@@ -1087,8 +1151,15 @@ func (h *Handler) handleAttachedClients(w http.ResponseWriter, r *http.Request) 
 func (h *Handler) handleRecoveryEmailStatus(w http.ResponseWriter, r *http.Request) {
 	slog.Info("Recovery email status request")
 
+	_, email, err := h.getUserFromRequest(r)
+	if err != nil {
+		slog.Warn("Recovery email status: failed to get user from request", "error", err)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	response := map[string]any{
-		"email":           h.username + "@localhost",
+		"email":           email,
 		"verified":        true,
 		"sessionVerified": true,
 		"emailVerified":   true,
@@ -1129,13 +1200,23 @@ func (h *Handler) handleOAuthDestroy(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleProfile(w http.ResponseWriter, r *http.Request) {
 	slog.Info("Profile request")
 
-	// Use a consistent UID based on username
-	uid := fmt.Sprintf("%x", sha256.Sum256([]byte(h.username)))[:32]
+	userID, email, err := h.getUserFromRequest(r)
+	if err != nil {
+		slog.Warn("Profile: failed to get user from request", "error", err)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Extract display name from email
+	displayName := email
+	if atIndex := strings.Index(email, "@"); atIndex > 0 {
+		displayName = email[:atIndex]
+	}
 
 	response := map[string]any{
-		"uid":                     uid,
-		"email":                   h.username + "@localhost",
-		"displayName":             h.username,
+		"uid":                     userID,
+		"email":                   email,
+		"displayName":             displayName,
 		"avatar":                  nil,
 		"avatarDefault":           true,
 		"amrValues":               []string{"pwd"},
@@ -1443,8 +1524,8 @@ const loginHTML = `<!DOCTYPE html>
             <input type="hidden" name="code_challenge_method" value="{{.CodeChallengeMethod}}">
             <input type="hidden" name="keys_jwk" value="{{.KeysJWK}}">
             <div class="form-group">
-                <label for="username">Username</label>
-                <input type="text" id="username" name="username" required autofocus>
+                <label for="email">Email</label>
+                <input type="email" id="email" name="email" required autofocus>
             </div>
             <div class="form-group">
                 <label for="password">Password</label>

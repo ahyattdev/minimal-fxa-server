@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package usermgmt;
+
+option go_package = "github.com/ahyattdev/minimal-fxa-server/usermgmt";
+
+// UserManagement service for managing local users
+// This service is only exposed via Unix socket for security
+service UserManagement {
+    // CreateUser creates a new local user
+    rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
+    
+    // DeleteUser deletes a local user
+    rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse);
+    
+    // ChangePassword changes a user's password
+    rpc ChangePassword(ChangePasswordRequest) returns (ChangePasswordResponse);
+    
+    // ListUsers lists all local users
+    rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+}
+
+message CreateUserRequest {
+    string email = 1;
+    string password = 2;
+}
+
+message CreateUserResponse {
+    string user_id = 1;
+    string email = 2;
+}
+
+message DeleteUserRequest {
+    string email = 1;
+}
+
+message DeleteUserResponse {
+    bool success = 1;
+}
+
+message ChangePasswordRequest {
+    string email = 1;
+    string new_password = 2;
+}
+
+message ChangePasswordResponse {
+    bool success = 1;
+}
+
+message ListUsersRequest {
+}
+
+message ListUsersResponse {
+    repeated User users = 1;
+}
+
+message User {
+    string id = 1;
+    string email = 2;
+}
+
