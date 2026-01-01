@@ -123,12 +123,46 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Generate a session token for this login
+	sessionToken := generateHexString(64)
+
+	// Store session in database
+	session := &database.Session{
+		ID:           sessionToken,
+		UserID:       userID,
+		CreatedAt:    time.Now(),
+		LastAccessAt: time.Now(),
+	}
+	if err := h.db.Create(session).Error; err != nil {
+		slog.Error("Failed to store session", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
 	// Prepare OAuth data (for fxaccounts:oauth_login)
+	// Firefox expects these fields for OAuth login
 	oauthData := map[string]any{
-		"code":  code,
-		"state": state,
+		"code":                code,
+		"state":               state,
+		"redirect":            "web",
+		"action":              "signin",
+		"uid":                 userID,
+		"email":               h.username + "@localhost",
+		"verified":            true,
+		"sessionToken":        sessionToken,
+		"declinedSyncEngines": []string{},
+		"offeredSyncEngines":  []string{"bookmarks", "history", "passwords", "tabs", "addons", "preferences"},
 	}
 	oauthJSON, _ := json.Marshal(oauthData)
+
+	// Prepare login data (for fxaccounts:login - sets up user in Firefox)
+	loginData := map[string]any{
+		"uid":          userID,
+		"email":        h.username + "@localhost",
+		"sessionToken": sessionToken,
+		"verified":     true,
+	}
+	loginJSON, _ := json.Marshal(loginData)
 
 	w.Header().Set("Content-Type", "text/html")
 	html := `<!DOCTYPE html>
@@ -139,6 +173,7 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 <script>
 (function() {
   const status = document.getElementById('status');
+  const loginData = ` + string(loginJSON) + `;
   const oauthData = ` + string(oauthJSON) + `;
   
   function sendWebChannel(command, payload, messageId) {
@@ -160,6 +195,8 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
     return messageId;
   }
   
+  let loginAcknowledged = false;
+  
   // Listen for responses from Firefox
   window.addEventListener('WebChannelMessageToContent', function(e) {
     console.log('[FxA] Received from Firefox:', e.detail);
@@ -169,18 +206,34 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
     }
     const cmd = detail.message?.command;
     const msgId = detail.message?.messageId;
+    const data = detail.message?.data;
     
     if (cmd === 'fxaccounts:can_link_account') {
       sendWebChannel('fxaccounts:can_link_account', { ok: true }, msgId);
+    } else if (cmd === 'fxaccounts:login' && !data?.error) {
+      // Firefox acknowledged the login, now send OAuth
+      console.log('[FxA] Login acknowledged, sending OAuth login');
+      loginAcknowledged = true;
+      sendWebChannel('fxaccounts:oauth_login', oauthData);
+      console.log('[FxA] OAuth login sent with data:', oauthData);
+    } else if (cmd === 'fxaccounts:oauth_login' && !data?.error) {
+      status.textContent = 'Sign-in complete! You can close this tab.';
     }
   });
   
-  status.textContent = 'Completing sign-in...';
+  status.textContent = 'Setting up account...';
   
-  // Send fxaccounts:oauth_login to complete OAuth flow
-  sendWebChannel('fxaccounts:oauth_login', oauthData);
-  console.log('[FxA] OAuth login sent with data:', oauthData);
-  status.textContent = 'Sign-in complete! You can close this tab.';
+  // Step 1: Send fxaccounts:login to set up user data in Firefox
+  console.log('[FxA] Sending login data:', loginData);
+  sendWebChannel('fxaccounts:login', loginData);
+  
+  // Fallback: if login doesn't get acknowledged within 2 seconds, try OAuth anyway
+  setTimeout(function() {
+    if (!loginAcknowledged) {
+      console.log('[FxA] Login not acknowledged, trying OAuth anyway');
+      sendWebChannel('fxaccounts:oauth_login', oauthData);
+    }
+  }, 2000);
 })();
 </script>
 </body>
@@ -1248,9 +1301,8 @@ window.addEventListener('WebChannelMessageToContent', function(e) {
     }
 });
 
-// Initialize WebChannel
-sendWebChannel('fxaccounts:loaded');
-console.log('[FxA] WebChannel initialized');
+// WebChannel is ready - Firefox will send fxaccounts:fxa_status when it's ready
+console.log('[FxA] WebChannel listener ready');
 </script>
 </body>
 </html>`
