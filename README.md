@@ -28,7 +28,7 @@ A minimal Firefox Accounts server implementation in Go.
 - `BASE_URL` - Base URL for the server (default: `http://localhost:$HTTP_PORT`)
 - `SYNC_SERVER_URL` - URL to syncstorage-rs token server
 - `AUTH_METHOD` - Authentication method: `local` or `oidc` (default: `local`)
-- `FXA_SOCKET` - Unix socket path for user management gRPC (default: `/tmp/fxa-usermgmt.sock`)
+- `FXA_SOCKET` - Unix socket path for user management gRPC (default: `/var/run/fxa/usermgmt.sock`)
 
 ### VAPID (Push Notifications)
 - `VAPID_PRIVATE_KEY` - Base64url-encoded EC P-256 private key

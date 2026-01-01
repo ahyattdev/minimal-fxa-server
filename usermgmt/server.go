@@ -105,7 +105,7 @@ func (s *Server) ListUsers(ctx context.Context, req *ListUsersRequest) (*ListUse
 }
 
 // DefaultSocketPath is the default Unix socket path for user management
-const DefaultSocketPath = "/tmp/fxa-usermgmt.sock"
+const DefaultSocketPath = "/var/run/fxa/usermgmt.sock"
 
 // StartServer starts the gRPC server on a Unix socket
 func StartServer(provider *local.Provider, socketPath string) error {
