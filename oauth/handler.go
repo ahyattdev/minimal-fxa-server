@@ -267,8 +267,14 @@ func (h *Handler) handleToken(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 
+		// Get or create user to get stable keysChangedAt
+		keysChangedAt, err := h.getOrCreateUser(tx, authCode.UserID)
+		if err != nil {
+			return fmt.Errorf("failed to get/create user: %w", err)
+		}
+
 		// Generate JWT access token
-		accessToken, err := h.generateAccessToken(authCode.UserID, authCode.ClientID, scope, expiresAt)
+		accessToken, err := h.generateAccessToken(authCode.UserID, authCode.ClientID, scope, expiresAt, keysChangedAt)
 		if err != nil {
 			return fmt.Errorf("failed to generate access token: %w", err)
 		}
@@ -451,8 +457,32 @@ func bigIntToBytes(e int) []byte {
 	return result
 }
 
+// getOrCreateUser ensures a user exists and returns their keysChangedAt timestamp
+func (h *Handler) getOrCreateUser(tx *gorm.DB, userID string) (int64, error) {
+	var user database.User
+	result := tx.Where("id = ?", userID).First(&user)
+	if result.Error == nil {
+		return user.KeysChangedAt, nil
+	}
+	if result.Error != gorm.ErrRecordNotFound {
+		return 0, result.Error
+	}
+
+	// User doesn't exist, create with current timestamp as keysChangedAt
+	user = database.User{
+		ID:            userID,
+		KeysChangedAt: time.Now().Unix(),
+		CreatedAt:     time.Now(),
+	}
+	if err := tx.Create(&user).Error; err != nil {
+		return 0, err
+	}
+	slog.Info("Created new user", "userID", userID, "keysChangedAt", user.KeysChangedAt)
+	return user.KeysChangedAt, nil
+}
+
 // generateAccessToken creates a signed JWT access token
-func (h *Handler) generateAccessToken(userID, clientID, scope string, expiresAt time.Time) (string, error) {
+func (h *Handler) generateAccessToken(userID, clientID, scope string, expiresAt time.Time, keysChangedAt int64) (string, error) {
 	claims := jwt.MapClaims{
 		"iss":            h.baseURL, // Issuer - required for JWT verification
 		"sub":            userID,
@@ -461,7 +491,7 @@ func (h *Handler) generateAccessToken(userID, clientID, scope string, expiresAt 
 		"scope":          scope,
 		"iat":            time.Now().Unix(),
 		"exp":            expiresAt.Unix(),
-		"fxa-generation": time.Now().Unix(), // Required by syncstorage-rs
+		"fxa-generation": keysChangedAt, // Must be stable per user for syncstorage-rs
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
@@ -537,32 +567,40 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 
 		expiresAt := time.Now().Add(time.Duration(ttl) * time.Second)
 
-		// Generate JWT access token
-		accessToken, err := h.generateAccessToken(userID, req.ClientID, scope, expiresAt)
-		if err != nil {
-			slog.Error("Failed to generate JWT for fxa-credentials", "error", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
+		var oauthToken *database.OAuthToken
+		err := h.db.Transaction(func(tx *gorm.DB) error {
+			// Get or create user to get stable keysChangedAt
+			keysChangedAt, err := h.getOrCreateUser(tx, userID)
+			if err != nil {
+				return fmt.Errorf("failed to get/create user: %w", err)
+			}
 
-		// Store the token in database
-		oauthToken := &database.OAuthToken{
-			AccessToken:  accessToken,
-			RefreshToken: generateRandomString(64), // Generate one for potential future use
-			UserID:       userID,
-			ClientID:     req.ClientID,
-			Scope:        scope,
-			CreatedAt:    time.Now(),
-			ExpiresAt:    expiresAt,
-		}
-		if err := h.db.Create(oauthToken).Error; err != nil {
+			// Generate JWT access token
+			accessToken, err := h.generateAccessToken(userID, req.ClientID, scope, expiresAt, keysChangedAt)
+			if err != nil {
+				return fmt.Errorf("failed to generate access token: %w", err)
+			}
+
+			// Store the token in database
+			oauthToken = &database.OAuthToken{
+				AccessToken:  accessToken,
+				RefreshToken: generateRandomString(64), // Generate one for potential future use
+				UserID:       userID,
+				ClientID:     req.ClientID,
+				Scope:        scope,
+				CreatedAt:    time.Now(),
+				ExpiresAt:    expiresAt,
+			}
+			return tx.Create(oauthToken).Error
+		})
+		if err != nil {
 			slog.Error("Failed to create token for fxa-credentials", "error", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 
 		response := map[string]any{
-			"access_token": accessToken,
+			"access_token": oauthToken.AccessToken,
 			"token_type":   "bearer",
 			"expires_in":   ttl,
 			"scope":        scope,
@@ -602,9 +640,14 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 				scope = existingToken.Scope
 			}
 
+			// Get or create user to get stable keysChangedAt
+			keysChangedAt, err := h.getOrCreateUser(tx, existingToken.UserID)
+			if err != nil {
+				return fmt.Errorf("failed to get/create user: %w", err)
+			}
+
 			// Generate JWT access token
-			var err error
-			newAccessToken, err = h.generateAccessToken(existingToken.UserID, existingToken.ClientID, scope, expiresAt)
+			newAccessToken, err = h.generateAccessToken(existingToken.UserID, existingToken.ClientID, scope, expiresAt, keysChangedAt)
 			if err != nil {
 				return fmt.Errorf("failed to generate access token: %w", err)
 			}
@@ -662,8 +705,14 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 
+		// Get or create user to get stable keysChangedAt
+		keysChangedAt, err := h.getOrCreateUser(tx, authCode.UserID)
+		if err != nil {
+			return fmt.Errorf("failed to get/create user: %w", err)
+		}
+
 		// Generate JWT access token
-		accessToken, err := h.generateAccessToken(authCode.UserID, authCode.ClientID, scope, expiresAt)
+		accessToken, err := h.generateAccessToken(authCode.UserID, authCode.ClientID, scope, expiresAt, keysChangedAt)
 		if err != nil {
 			return fmt.Errorf("failed to generate access token: %w", err)
 		}

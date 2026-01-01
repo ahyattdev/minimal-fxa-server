@@ -57,6 +57,13 @@ type Session struct {
 	LastAccessAt time.Time
 }
 
+// User represents a Firefox Account user
+type User struct {
+	ID            string `gorm:"primaryKey"` // MD5 hash of username
+	KeysChangedAt int64  // Unix timestamp, set once on first login, used in JWT fxa-generation
+	CreatedAt     time.Time
+}
+
 // Connect initializes the database connection and runs migrations
 func Connect(databaseURI string) (*gorm.DB, error) {
 	db, err := gorm.Open(postgres.Open(databaseURI), &gorm.Config{
@@ -69,7 +76,7 @@ func Connect(databaseURI string) (*gorm.DB, error) {
 	slog.Info("Connected to database")
 
 	// Auto-migrate schemas
-	err = db.AutoMigrate(&Device{}, &AuthCode{}, &OAuthToken{}, &Session{})
+	err = db.AutoMigrate(&Device{}, &AuthCode{}, &OAuthToken{}, &Session{}, &User{})
 	if err != nil {
 		return nil, err
 	}
