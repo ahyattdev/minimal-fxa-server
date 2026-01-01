@@ -451,7 +451,9 @@ func (h *Handler) handleJWKS(w http.ResponseWriter, r *http.Request) {
 // generateAccessToken creates a signed JWT access token
 func (h *Handler) generateAccessToken(userID, clientID, scope string, expiresAt time.Time) (string, error) {
 	claims := jwt.MapClaims{
+		"iss":            h.baseURL, // Issuer - required for JWT verification
 		"sub":            userID,
+		"aud":            clientID, // Audience - the client this token is for
 		"client_id":      clientID,
 		"scope":          scope,
 		"iat":            time.Now().Unix(),
