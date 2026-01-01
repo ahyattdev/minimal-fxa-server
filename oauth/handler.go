@@ -11,16 +11,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/SherClockHolmes/webpush-go"
 	"github.com/ahyattdev/minimal-fxa-server/database"
 	"github.com/golang-jwt/jwt/v5"
 	"gorm.io/gorm"
 )
+
+// VAPIDConfig holds Web Push VAPID configuration
+type VAPIDConfig struct {
+	PrivateKey string // Base64url-encoded private key
+	PublicKey  string // Base64url-encoded public key
+	Subscriber string // Contact email (mailto:...)
+}
 
 type Handler struct {
 	baseURL       string
@@ -30,9 +37,10 @@ type Handler struct {
 	privateKey    *rsa.PrivateKey
 	keyID         string
 	loginTemplate *template.Template
+	vapid         VAPIDConfig
 }
 
-func NewHandler(baseURL, username, password string, db *gorm.DB, privateKey *rsa.PrivateKey) *Handler {
+func NewHandler(baseURL, username, password string, db *gorm.DB, privateKey *rsa.PrivateKey, vapid VAPIDConfig) *Handler {
 	// Generate a key ID from the public key modulus
 	keyIDHash := sha256.Sum256(privateKey.PublicKey.N.Bytes())
 	keyID := base64.RawURLEncoding.EncodeToString(keyIDHash[:8])
@@ -45,6 +53,7 @@ func NewHandler(baseURL, username, password string, db *gorm.DB, privateKey *rsa
 		privateKey:    privateKey,
 		keyID:         keyID,
 		loginTemplate: template.Must(template.New("login").Parse(loginHTML)),
+		vapid:         vapid,
 	}
 }
 
@@ -59,6 +68,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /auth/v1/oauth/token", h.handleAuthToken)
 	mux.HandleFunc("POST /auth/v1/account/device", h.handleDevice)
 	mux.HandleFunc("GET /auth/v1/account/devices", h.handleDevices)
+	mux.HandleFunc("POST /auth/v1/account/devices/notify", h.handleDevicesNotify)
 	mux.HandleFunc("GET /auth/v1/account/attached_clients", h.handleAttachedClients)
 	mux.HandleFunc("GET /auth/v1/recovery_email/status", h.handleRecoveryEmailStatus)
 	mux.HandleFunc("POST /auth/v1/account/keys", h.handleAccountKeys)
@@ -522,11 +532,6 @@ func (h *Handler) verifyAccessToken(tokenString string) (jwt.MapClaims, error) {
 }
 
 func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
-	// Firefox sends JSON body for token requests
-	// First, read and log the raw body for debugging
-	bodyBytes, _ := io.ReadAll(r.Body)
-	slog.Info("Raw token request body", "body", string(bodyBytes), "length", len(bodyBytes))
-
 	var req struct {
 		Code         string `json:"code"`
 		ClientID     string `json:"client_id"`
@@ -537,7 +542,7 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 		TTL          int    `json:"ttl"`
 	}
 
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		slog.Warn("Failed to decode token request", "error", err)
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
@@ -884,6 +889,139 @@ func (h *Handler) handleDevices(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
+}
+
+func (h *Handler) handleDevicesNotify(w http.ResponseWriter, r *http.Request) {
+	slog.Info("Device notify request")
+
+	// Check if VAPID is configured
+	if h.vapid.PrivateKey == "" || h.vapid.PublicKey == "" {
+		slog.Warn("Push notifications not configured - VAPID keys missing")
+		// Return success anyway - Firefox doesn't require this to work
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{})
+		return
+	}
+
+	userID := fmt.Sprintf("%x", sha256.Sum256([]byte(h.username)))[:32]
+
+	// Parse request body
+	var req struct {
+		To       any             `json:"to"`       // "all" or array of device IDs
+		Excluded []string        `json:"excluded"` // Device IDs to exclude
+		Payload  json.RawMessage `json:"payload"`  // Encrypted payload to send
+		TTL      int             `json:"TTL"`      // Time-to-live in seconds
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		slog.Warn("Invalid notify request body", "error", err)
+		http.Error(w, `{"error":"invalid_request"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Get current device ID from the access token (to exclude self)
+	var currentDeviceID string
+	if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+		accessToken := strings.TrimPrefix(authHeader, "Bearer ")
+		var token database.OAuthToken
+		if err := h.db.Where("access_token = ?", accessToken).First(&token).Error; err == nil && token.DeviceID != nil {
+			currentDeviceID = *token.DeviceID
+		}
+	}
+
+	// Get target devices
+	var devices []database.Device
+	if err := h.db.Where("user_id = ?", userID).Find(&devices).Error; err != nil {
+		slog.Error("Failed to fetch devices for notify", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Build exclusion set
+	excluded := make(map[string]bool)
+	for _, id := range req.Excluded {
+		excluded[id] = true
+	}
+	// Always exclude the current device
+	if currentDeviceID != "" {
+		excluded[currentDeviceID] = true
+	}
+
+	// Determine which devices to notify
+	var targetDeviceIDs map[string]bool
+	switch to := req.To.(type) {
+	case string:
+		if to == "all" {
+			targetDeviceIDs = nil // nil means all
+		}
+	case []any:
+		targetDeviceIDs = make(map[string]bool)
+		for _, id := range to {
+			if idStr, ok := id.(string); ok {
+				targetDeviceIDs[idStr] = true
+			}
+		}
+	}
+
+	// Send push notifications
+	successCount := 0
+	for _, device := range devices {
+		// Skip if excluded
+		if excluded[device.ID] {
+			continue
+		}
+		// Skip if not in target list (when specific targets provided)
+		if targetDeviceIDs != nil && !targetDeviceIDs[device.ID] {
+			continue
+		}
+		// Skip if no push subscription
+		if device.PushCallback == nil || *device.PushCallback == "" {
+			continue
+		}
+
+		// Send push notification
+		if err := h.sendPushNotification(device, req.Payload, req.TTL); err != nil {
+			slog.Warn("Failed to send push notification", "deviceID", device.ID, "error", err)
+		} else {
+			successCount++
+		}
+	}
+
+	slog.Info("Push notifications sent", "count", successCount)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{})
+}
+
+func (h *Handler) sendPushNotification(device database.Device, payload json.RawMessage, ttl int) error {
+	if device.PushCallback == nil || device.PushPublicKey == nil || device.PushAuthKey == nil {
+		return fmt.Errorf("device missing push subscription info")
+	}
+
+	subscription := &webpush.Subscription{
+		Endpoint: *device.PushCallback,
+		Keys: webpush.Keys{
+			P256dh: *device.PushPublicKey,
+			Auth:   *device.PushAuthKey,
+		},
+	}
+
+	options := &webpush.Options{
+		Subscriber:      h.vapid.Subscriber,
+		VAPIDPublicKey:  h.vapid.PublicKey,
+		VAPIDPrivateKey: h.vapid.PrivateKey,
+		TTL:             ttl,
+	}
+
+	resp, err := webpush.SendNotification(payload, subscription, options)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("push service returned %d", resp.StatusCode)
+	}
+
+	return nil
 }
 
 func (h *Handler) handleAttachedClients(w http.ResponseWriter, r *http.Request) {

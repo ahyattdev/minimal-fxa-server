@@ -71,6 +71,19 @@ func main() {
 	}
 	slog.Info("JWT signing key loaded", "bits", privateKey.N.BitLen())
 
+	// Parse VAPID keys for Web Push (optional - push notifications won't work without them)
+	vapidPrivateKey := os.Getenv("VAPID_PRIVATE_KEY")
+	vapidPublicKey := os.Getenv("VAPID_PUBLIC_KEY")
+	vapidEmail := os.Getenv("VAPID_EMAIL")
+	if vapidPrivateKey == "" || vapidPublicKey == "" {
+		slog.Warn("VAPID_PRIVATE_KEY or VAPID_PUBLIC_KEY not set - push notifications disabled")
+	} else {
+		if vapidEmail == "" {
+			vapidEmail = "mailto:admin@localhost"
+		}
+		slog.Info("VAPID keys loaded - push notifications enabled")
+	}
+
 	db, err := database.Connect(databaseURI)
 	if err != nil {
 		slog.Error("Failed to connect to database", "error", err)
@@ -82,7 +95,12 @@ func main() {
 	autoconfigHandler := autoconfig.NewHandler(baseURL, syncServerURL)
 	autoconfigHandler.RegisterRoutes(mux)
 
-	oauthHandler := oauth.NewHandler(baseURL, "username", "password", db, privateKey)
+	vapidConfig := oauth.VAPIDConfig{
+		PrivateKey: vapidPrivateKey,
+		PublicKey:  vapidPublicKey,
+		Subscriber: vapidEmail,
+	}
+	oauthHandler := oauth.NewHandler(baseURL, "username", "password", db, privateKey, vapidConfig)
 	oauthHandler.RegisterRoutes(mux)
 
 	mux.HandleFunc("/{path...}", func(w http.ResponseWriter, r *http.Request) {
