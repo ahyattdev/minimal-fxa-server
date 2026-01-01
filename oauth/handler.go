@@ -4,8 +4,8 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
-	"crypto/ecdsa"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -27,15 +27,14 @@ type Handler struct {
 	username      string
 	password      string
 	db            *gorm.DB
-	privateKey    *ecdsa.PrivateKey
+	privateKey    *rsa.PrivateKey
 	keyID         string
 	loginTemplate *template.Template
 }
 
-func NewHandler(baseURL, username, password string, db *gorm.DB, privateKey *ecdsa.PrivateKey) *Handler {
-	// Generate a key ID from the public key
-	pubKeyBytes := append(privateKey.PublicKey.X.Bytes(), privateKey.PublicKey.Y.Bytes()...)
-	keyIDHash := sha256.Sum256(pubKeyBytes)
+func NewHandler(baseURL, username, password string, db *gorm.DB, privateKey *rsa.PrivateKey) *Handler {
+	// Generate a key ID from the public key modulus
+	keyIDHash := sha256.Sum256(privateKey.PublicKey.N.Bytes())
 	keyID := base64.RawURLEncoding.EncodeToString(keyIDHash[:8])
 
 	return &Handler{
@@ -417,27 +416,16 @@ func (h *Handler) handleVerify(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleJWKS(w http.ResponseWriter, r *http.Request) {
 	slog.Info("JWKS request")
 
-	// Return the public key in JWK format
+	// Return the public key in JWK format (RSA)
 	pubKey := &h.privateKey.PublicKey
 
-	// Pad coordinates to 32 bytes for P-256
-	xBytes := pubKey.X.Bytes()
-	yBytes := pubKey.Y.Bytes()
-	if len(xBytes) < 32 {
-		xBytes = append(make([]byte, 32-len(xBytes)), xBytes...)
-	}
-	if len(yBytes) < 32 {
-		yBytes = append(make([]byte, 32-len(yBytes)), yBytes...)
-	}
-
 	jwk := map[string]any{
-		"kty": "EC",
-		"crv": "P-256",
-		"x":   base64.RawURLEncoding.EncodeToString(xBytes),
-		"y":   base64.RawURLEncoding.EncodeToString(yBytes),
+		"kty": "RSA",
+		"n":   base64.RawURLEncoding.EncodeToString(pubKey.N.Bytes()),
+		"e":   base64.RawURLEncoding.EncodeToString(bigIntToBytes(pubKey.E)),
 		"kid": h.keyID,
 		"use": "sig",
-		"alg": "ES256",
+		"alg": "RS256",
 	}
 
 	response := map[string]any{
@@ -446,6 +434,21 @@ func (h *Handler) handleJWKS(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+// bigIntToBytes converts an int (RSA exponent) to bytes
+func bigIntToBytes(e int) []byte {
+	// RSA public exponent is typically 65537 (0x10001)
+	if e == 65537 {
+		return []byte{0x01, 0x00, 0x01}
+	}
+	// Handle other cases
+	result := make([]byte, 0)
+	for e > 0 {
+		result = append([]byte{byte(e & 0xff)}, result...)
+		e >>= 8
+	}
+	return result
 }
 
 // generateAccessToken creates a signed JWT access token
@@ -461,8 +464,9 @@ func (h *Handler) generateAccessToken(userID, clientID, scope string, expiresAt 
 		"fxa-generation": time.Now().Unix(), // Required by syncstorage-rs
 	}
 
-	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	token.Header["kid"] = h.keyID
+	token.Header["typ"] = "at+jwt" // Required by syncstorage-rs
 
 	return token.SignedString(h.privateKey)
 }
@@ -470,7 +474,7 @@ func (h *Handler) generateAccessToken(userID, clientID, scope string, expiresAt 
 // verifyAccessToken validates a JWT and returns its claims
 func (h *Handler) verifyAccessToken(tokenString string) (jwt.MapClaims, error) {
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodECDSA); !ok {
+		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
 		return &h.privateKey.PublicKey, nil

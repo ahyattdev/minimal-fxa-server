@@ -1,7 +1,7 @@
 package main
 
 import (
-	"crypto/ecdsa"
+	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
 	"log/slog"
@@ -38,7 +38,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Parse JWT signing key (EC P-256 private key in PEM format)
+	// Parse JWT signing key (RSA private key in PEM format)
 	jwtKeyPEM := os.Getenv("JWT_PRIVATE_KEY")
 	if jwtKeyPEM == "" {
 		slog.Error("JWT_PRIVATE_KEY environment variable is required")
@@ -51,22 +51,25 @@ func main() {
 		os.Exit(1)
 	}
 
-	privateKey, err := x509.ParseECPrivateKey(block.Bytes)
-	if err != nil {
-		// Try PKCS8 format
+	var privateKey *rsa.PrivateKey
+	// Try PKCS1 format first (RSA PRIVATE KEY)
+	if key, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
+		privateKey = key
+	} else {
+		// Try PKCS8 format (PRIVATE KEY)
 		key, err2 := x509.ParsePKCS8PrivateKey(block.Bytes)
 		if err2 != nil {
-			slog.Error("Failed to parse JWT_PRIVATE_KEY", "error", err, "pkcs8_error", err2)
+			slog.Error("Failed to parse JWT_PRIVATE_KEY", "pkcs1_error", err, "pkcs8_error", err2)
 			os.Exit(1)
 		}
 		var ok bool
-		privateKey, ok = key.(*ecdsa.PrivateKey)
+		privateKey, ok = key.(*rsa.PrivateKey)
 		if !ok {
-			slog.Error("JWT_PRIVATE_KEY is not an EC private key")
+			slog.Error("JWT_PRIVATE_KEY is not an RSA private key")
 			os.Exit(1)
 		}
 	}
-	slog.Info("JWT signing key loaded", "curve", privateKey.Curve.Params().Name)
+	slog.Info("JWT signing key loaded", "bits", privateKey.N.BitLen())
 
 	db, err := database.Connect(databaseURI)
 	if err != nil {
