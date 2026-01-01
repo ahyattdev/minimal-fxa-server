@@ -19,35 +19,59 @@ A minimal Firefox Accounts server implementation in Go.
 
 ## Environment Variables
 
+### Required
+- `DATABASE_URI` - PostgreSQL connection string
+- `JWT_PRIVATE_KEY` - RSA private key in PEM format for signing JWTs
+
+### Optional
 - `HTTP_PORT` - Server port (default: `80`)
 - `BASE_URL` - Base URL for the server (default: `http://localhost:$HTTP_PORT`)
+- `SYNC_SERVER_URL` - URL to syncstorage-rs token server
+- `AUTH_METHOD` - Authentication method: `local` or `oidc` (default: `local`)
+- `FXA_SOCKET` - Unix socket path for user management gRPC (default: `/tmp/fxa-usermgmt.sock`)
 
-## Default Credentials
+### VAPID (Push Notifications)
+- `VAPID_PRIVATE_KEY` - Base64url-encoded EC P-256 private key
+- `VAPID_PUBLIC_KEY` - Base64url-encoded EC P-256 public key
+- `VAPID_EMAIL` - Contact email for push service (default: `mailto:admin@localhost`)
 
-- Username: `username`
-- Password: `password`
+### OIDC Authentication (when AUTH_METHOD=oidc)
+- `OIDC_ISSUER` - OIDC provider URL (required)
+- `OIDC_CLIENT_ID` - OAuth client ID (required)
+- `OIDC_CLIENT_SECRET` - OAuth client secret
+- `OIDC_REDIRECT_URL` - Callback URL (default: `{BASE_URL}/oidc/callback`)
+- `OIDC_SCOPES` - Comma-separated scopes (default: `openid,email,profile`)
 
-## Current Status
+## Authentication
 
-### ✅ Working
-- Firefox Accounts autoconfig (`.well-known/fxa-client-configuration`)
-- WebChannel communication with Firefox
-- Basic username/password authentication
-- OAuth authorization flow with PKCE
-- JWE key exchange (ECDH-ES + A256GCM)
-- Scoped keys for sync (`https://identity.mozilla.com/apps/oldsync`)
-- Token Server (`/token/1.0/sync/1.5`)
-- Profile endpoint
-- Device registration
-- Session management
+### Local Authentication (default)
 
-### 🔧 In Progress: Firefox Sync
+Users are stored in the PostgreSQL database with bcrypt-hashed passwords. There are no default credentials - users must be created using the CLI.
 
-The JWE key exchange and Token Server are now implemented. Firefox can receive encrypted sync keys
-and obtain tokens for the Sync storage server.
+#### User Management CLI
 
-**Note:** Full Sync functionality requires a Sync Storage Server implementation.
-The Token Server points to `/storage/1.5/{uid}` but this endpoint is not yet implemented.
+```bash
+# Create a user (prompts for password)
+fxa-user create user@example.com
+
+# Delete a user
+fxa-user delete user@example.com
+
+# Change password
+fxa-user passwd user@example.com
+
+# List all users
+fxa-user list
+```
+
+The CLI connects via Unix socket for security. In Docker/Kubernetes:
+```bash
+kubectl exec -it <pod> -- fxa-user create admin@example.com
+```
+
+### OIDC Authentication
+
+Set `AUTH_METHOD=oidc` and configure the OIDC environment variables. Users will be redirected to your identity provider for authentication.
 
 ## API Endpoints
 
@@ -58,20 +82,40 @@ The Token Server points to `/storage/1.5/{uid}` but this endpoint is not yet imp
 - `GET /` - Login page
 - `POST /` - Login submission
 - `POST /oauth/v1/token` - Token exchange
+- `POST /oauth/v1/verify` - Token verification
+- `GET /oauth/v1/jwks` - JSON Web Key Set
+
+### Auth Server
 - `POST /auth/v1/oauth/token` - Auth server token endpoint
+- `POST /auth/v1/account/device` - Device registration
+- `GET /auth/v1/account/devices` - List devices
+- `POST /auth/v1/account/devices/notify` - Push notifications
+- `GET /auth/v1/account/device/commands` - Device commands
+- `GET /auth/v1/account/attached_clients` - Attached clients
+- `GET /auth/v1/recovery_email/status` - Email verification status
+- `POST /auth/v1/account/keys` - Account keys
+- `POST /auth/v1/session/destroy` - Session logout
+- `POST /auth/v1/oauth/destroy` - OAuth token revocation
 
 ### Profile
 - `GET /profile/v1/profile` - User profile
 
-### Account
-- `POST /auth/v1/account/device` - Device registration
-- `GET /auth/v1/recovery_email/status` - Email verification status
-- `POST /auth/v1/account/keys` - Account keys (placeholder)
-- `POST /auth/v1/session/destroy` - Session logout
-- `POST /auth/v1/oauth/destroy` - OAuth token revocation
+## Building
 
-### Token Server (Sync)
-- `GET /token/1.0/sync/1.5` - Get Sync storage token
+```bash
+# Build both binaries
+make build
+
+# Regenerate gRPC code (requires protoc)
+make generate
+```
+
+## Docker
+
+```bash
+docker build -t minimal-fxa-server .
+docker run -e DATABASE_URI=... -e JWT_PRIVATE_KEY=... minimal-fxa-server
+```
 
 # Attribution
 

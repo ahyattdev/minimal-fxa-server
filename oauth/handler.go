@@ -1462,7 +1462,7 @@ const loginHTML = `<!DOCTYPE html>
             font-weight: 500;
             color: #c0c0c0;
         }
-        input[type="text"], input[type="password"] {
+        input[type="text"], input[type="email"], input[type="password"] {
             width: 100%;
             padding: 14px 16px;
             border: 1px solid rgba(255, 255, 255, 0.15);

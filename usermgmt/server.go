@@ -105,7 +105,7 @@ func (s *Server) ListUsers(ctx context.Context, req *ListUsersRequest) (*ListUse
 }
 
 // DefaultSocketPath is the default Unix socket path for user management
-const DefaultSocketPath = "/var/run/fxa/usermgmt.sock"
+const DefaultSocketPath = "/tmp/fxa-usermgmt.sock"
 
 // StartServer starts the gRPC server on a Unix socket
 func StartServer(provider *local.Provider, socketPath string) error {
@@ -118,17 +118,12 @@ func StartServer(provider *local.Provider, socketPath string) error {
 		return err
 	}
 
-	// Create parent directory if it doesn't exist
-	if err := os.MkdirAll("/var/run/fxa", 0755); err != nil {
-		return err
-	}
-
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
 		return err
 	}
 
-	// Set socket permissions (only root can access)
+	// Set socket permissions (restrict access)
 	if err := os.Chmod(socketPath, 0600); err != nil {
 		listener.Close()
 		return err
