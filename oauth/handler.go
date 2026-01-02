@@ -802,10 +802,32 @@ func (h *Handler) getUserFromHawkAuth(r *http.Request) (userID, email string, er
 	// Use the hawk library for proper verification
 	hawkServer := hawk.NewServer(&hawkCredentialStore{db: h.db})
 
+	// Configure hawk server to use the external URL that Firefox is using
+	// Firefox computes MAC using the external URL, not the internal one seen by this server
+	parsedURL, err := url.Parse(h.baseURL)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid base URL configuration: %w", err)
+	}
+	externalHost := parsedURL.Host
+	if parsedURL.Port() == "" {
+		if parsedURL.Scheme == "https" {
+			externalHost = parsedURL.Host + ":443"
+		} else {
+			externalHost = parsedURL.Host + ":80"
+		}
+	}
+
+	hawkServer.AuthOption = &hawk.AuthOption{
+		CustomHostPort: externalHost,
+	}
+
 	cred, err := hawkServer.Authenticate(r)
 	if err != nil {
+		slog.Warn("Hawk authentication failed", "error", err, "path", r.URL.Path, "host", r.Host, "externalHost", externalHost)
 		return "", "", fmt.Errorf("hawk authentication failed: %w", err)
 	}
+
+	slog.Debug("Hawk authentication successful", "tokenId", cred.ID)
 
 	// Look up session by tokenId to get userId
 	var session database.Session
@@ -834,9 +856,14 @@ type hawkCredentialStore struct {
 func (s *hawkCredentialStore) GetCredential(id string) (*hawk.Credential, error) {
 	var session database.Session
 	if err := s.db.Where("token_id = ?", id).First(&session).Error; err != nil {
-		return nil, fmt.Errorf("unknown credential id")
+		slog.Warn("Hawk credential lookup failed", "tokenId", id, "error", err)
+		return nil, fmt.Errorf("unknown credential id: %s", id)
 	}
 
+	slog.Debug("Hawk credential found", "tokenId", id, "userId", session.UserID)
+
+	// HawkKey is stored as raw bytes, use directly
+	// Go strings can contain arbitrary bytes
 	return &hawk.Credential{
 		ID:  id,
 		Key: string(session.HawkKey),
