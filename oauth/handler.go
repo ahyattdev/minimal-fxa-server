@@ -59,6 +59,9 @@ func NewHandler(baseURL string, authProvider auth.Provider, db *gorm.DB, private
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+	// Health check endpoint
+	mux.HandleFunc("GET /healthz", handleHealthCheck)
+
 	mux.HandleFunc("GET /{$}", h.handleAuthorizePage)
 	mux.HandleFunc("POST /{$}", h.handleLogin)
 	mux.HandleFunc("GET /oidc/callback", h.handleOIDCCallback)
@@ -80,6 +83,11 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 
 	// Profile server endpoints
 	mux.HandleFunc("GET /profile/v1/profile", h.handleProfile)
+}
+
+// handleHealthCheck returns 200 OK for load balancer health checks
+func handleHealthCheck(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
 }
 
 func (h *Handler) handleAuthorizePage(w http.ResponseWriter, r *http.Request) {
@@ -548,7 +556,6 @@ func (h *Handler) handleToken(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("Failed to generate keys_jwe", "error", err)
 		} else {
 			response["keys_jwe"] = keysJWE
-			slog.Info("Generated keys_jwe for sync")
 		}
 	}
 
@@ -571,8 +578,6 @@ func (h *Handler) handleVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slog.Info("Token verify request", "has_token", req.Token != "")
-
 	if req.Token == "" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
@@ -580,76 +585,42 @@ func (h *Handler) handleVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Try to verify as JWT first (cryptographically secure)
+	// Verify JWT
 	claims, err := h.verifyAccessToken(req.Token)
-	if err == nil {
-		// JWT verified successfully
-		userID, _ := claims["sub"].(string)
-		clientID, _ := claims["client_id"].(string)
-		scope, _ := claims["scope"].(string)
-		exp, _ := claims["exp"].(float64)
-		generation, _ := claims["fxa-generation"].(float64)
-
-		expiresIn := int(exp - float64(time.Now().Unix()))
-		if expiresIn < 0 {
-			slog.Warn("JWT token expired")
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"error": "invalid_token"})
-			return
-		}
-
-		response := map[string]any{
-			"user":       userID,
-			"client_id":  clientID,
-			"scope":      strings.Split(scope, " "),
-			"generation": int64(generation),
-		}
-
-		slog.Info("JWT token verified", "user", userID, "scope", scope)
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-		return
-	}
-
-	slog.Info("JWT verification failed, trying database lookup", "error", err)
-
-	// Fallback: Look up the token in database (for legacy opaque tokens)
-	var oauthToken database.OAuthToken
-	if err := h.db.Where("access_token = ?", req.Token).First(&oauthToken).Error; err != nil {
-		slog.Warn("Token not found for verify", "error", err)
+	if err != nil {
+		slog.Warn("JWT verification failed", "error", err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "invalid_token"})
 		return
 	}
 
-	// Check if token is expired
-	if time.Now().After(oauthToken.ExpiresAt) {
-		slog.Warn("Token expired")
+	userID, _ := claims["sub"].(string)
+	clientID, _ := claims["client_id"].(string)
+	scope, _ := claims["scope"].(string)
+	exp, _ := claims["exp"].(float64)
+	generation, _ := claims["fxa-generation"].(float64)
+
+	if int(exp-float64(time.Now().Unix())) < 0 {
+		slog.Warn("JWT token expired")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "invalid_token"})
 		return
 	}
 
-	// Return token info
 	response := map[string]any{
-		"user":       oauthToken.UserID,
-		"client_id":  oauthToken.ClientID,
-		"scope":      strings.Split(oauthToken.Scope, " "),
-		"generation": oauthToken.CreatedAt.Unix(),
+		"user":       userID,
+		"client_id":  clientID,
+		"scope":      strings.Split(scope, " "),
+		"generation": int64(generation),
 	}
-
-	slog.Info("Token verified via database", "user", oauthToken.UserID, "scope", oauthToken.Scope)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
 
 func (h *Handler) handleJWKS(w http.ResponseWriter, r *http.Request) {
-	slog.Info("JWKS request")
 
 	// Return the public key in JWK format (RSA)
 	pubKey := &h.privateKey.PublicKey
@@ -769,45 +740,28 @@ func (h *Handler) getUserFromRequest(r *http.Request) (userID, email string, err
 		return h.getUserFromHawkAuth(r)
 	}
 
-	// Try Bearer token authentication
+	// Try Bearer token authentication (JWT only)
 	if strings.HasPrefix(authHeader, "Bearer ") {
 		accessToken := strings.TrimPrefix(authHeader, "Bearer ")
 
-		// Try JWT verification first
 		claims, err := h.verifyAccessToken(accessToken)
-		if err == nil {
-			userID, _ = claims["sub"].(string)
-			// Get email from User table
-			var user database.User
-			if dbErr := h.db.Where("id = ?", userID).First(&user).Error; dbErr == nil && user.Email != "" {
-				return userID, user.Email, nil
-			}
-			// Fallback: check LocalUser table
-			var localUser database.LocalUser
-			if dbErr := h.db.Where("id = ?", userID).First(&localUser).Error; dbErr == nil {
-				return userID, localUser.Email, nil
-			}
-			return userID, userID + "@user", nil
+		if err != nil {
+			return "", "", fmt.Errorf("invalid token: %w", err)
 		}
 
-		// Fallback to database lookup for opaque tokens
-		var token database.OAuthToken
-		if err := h.db.Where("access_token = ?", accessToken).First(&token).Error; err != nil {
-			return "", "", fmt.Errorf("invalid token")
-		}
+		userID, _ = claims["sub"].(string)
 
 		// Get email from User table
 		var user database.User
-		if dbErr := h.db.Where("id = ?", token.UserID).First(&user).Error; dbErr == nil && user.Email != "" {
-			return token.UserID, user.Email, nil
+		if dbErr := h.db.Where("id = ?", userID).First(&user).Error; dbErr == nil && user.Email != "" {
+			return userID, user.Email, nil
 		}
 		// Fallback: check LocalUser table
 		var localUser database.LocalUser
-		if dbErr := h.db.Where("id = ?", token.UserID).First(&localUser).Error; dbErr == nil {
-			return token.UserID, localUser.Email, nil
+		if dbErr := h.db.Where("id = ?", userID).First(&localUser).Error; dbErr == nil {
+			return userID, localUser.Email, nil
 		}
-
-		return token.UserID, token.UserID + "@user", nil
+		return userID, userID + "@user", nil
 	}
 
 	return "", "", fmt.Errorf("missing or invalid Authorization header")
@@ -842,8 +796,6 @@ func (h *Handler) getUserFromHawkAuth(r *http.Request) (userID, email string, er
 		slog.Warn("Hawk authentication failed", "error", err, "path", r.URL.Path, "host", r.Host, "externalHost", externalHost)
 		return "", "", fmt.Errorf("hawk authentication failed: %w", err)
 	}
-
-	slog.Debug("Hawk authentication successful", "tokenId", cred.ID)
 
 	// Look up session by tokenId to get userId
 	var session database.Session
@@ -881,8 +833,6 @@ func (s *hawkCredentialStore) GetCredential(id string) (*hawk.Credential, error)
 		return nil, fmt.Errorf("unknown credential id: %s", id)
 	}
 
-	slog.Debug("Hawk credential found", "tokenId", id, "userId", session.UserID)
-
 	// HawkKey is stored as raw bytes, use directly
 	// Go strings can contain arbitrary bytes
 	return &hawk.Credential{
@@ -908,13 +858,6 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
-
-	slog.Info("Token exchange request",
-		"grant_type", req.GrantType,
-		"client_id", req.ClientID,
-		"has_code", req.Code != "",
-		"has_refresh_token", req.RefreshToken != "",
-		"scope", req.Scope)
 
 	// Handle fxa-credentials grant type (Mozilla-specific)
 	// Firefox uses this to get access tokens using session credentials
@@ -994,8 +937,6 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]string{"error": "invalid_request"})
 			return
 		}
-
-		slog.Info("Processing refresh token request")
 
 		var newAccessToken string
 		var scope string
@@ -1127,7 +1068,6 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("Failed to generate keys_jwe", "error", err)
 		} else {
 			response["keys_jwe"] = keysJWE
-			slog.Info("Generated keys_jwe for sync")
 		}
 	}
 
@@ -1137,7 +1077,6 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleDevice(w http.ResponseWriter, r *http.Request) {
-	slog.Info("Device registration request")
 
 	userID, _, err := h.getUserFromRequest(r)
 	if err != nil {
@@ -1223,7 +1162,6 @@ func (h *Handler) handleDevice(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleDevices(w http.ResponseWriter, r *http.Request) {
-	slog.Info("Device list request")
 
 	userID, _, err := h.getUserFromRequest(r)
 	if err != nil {
@@ -1271,7 +1209,6 @@ func (h *Handler) handleDevices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleDeviceCommands(w http.ResponseWriter, r *http.Request) {
-	slog.Info("Device commands request")
 
 	// Return empty commands list - we don't store commands server-side
 	// Commands are delivered via push notifications in real-time
@@ -1286,7 +1223,6 @@ func (h *Handler) handleDeviceCommands(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleDevicesNotify(w http.ResponseWriter, r *http.Request) {
-	slog.Info("Device notify request")
 
 	// Check if VAPID is configured
 	if h.vapid.PrivateKey == "" || h.vapid.PublicKey == "" {
@@ -1424,7 +1360,6 @@ func (h *Handler) sendPushNotification(device database.Device, payload json.RawM
 }
 
 func (h *Handler) handleAttachedClients(w http.ResponseWriter, r *http.Request) {
-	slog.Info("Attached clients request")
 
 	userID, _, err := h.getUserFromRequest(r)
 	if err != nil {
@@ -1469,7 +1404,6 @@ func (h *Handler) handleAttachedClients(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *Handler) handleRecoveryEmailStatus(w http.ResponseWriter, r *http.Request) {
-	slog.Info("Recovery email status request")
 
 	_, email, err := h.getUserFromRequest(r)
 	if err != nil {
@@ -1490,7 +1424,6 @@ func (h *Handler) handleRecoveryEmailStatus(w http.ResponseWriter, r *http.Reque
 }
 
 func (h *Handler) handleAccountKeys(w http.ResponseWriter, r *http.Request) {
-	slog.Info("Account keys request")
 
 	// Generate placeholder keys (in reality these need proper crypto)
 	kA := generateRandomString(64)
@@ -1506,19 +1439,16 @@ func (h *Handler) handleAccountKeys(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleSessionDestroy(w http.ResponseWriter, r *http.Request) {
-	slog.Info("Session destroy request")
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte("{}"))
 }
 
 func (h *Handler) handleOAuthDestroy(w http.ResponseWriter, r *http.Request) {
-	slog.Info("OAuth destroy request")
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte("{}"))
 }
 
 func (h *Handler) handleProfile(w http.ResponseWriter, r *http.Request) {
-	slog.Info("Profile request")
 
 	userID, email, err := h.getUserFromRequest(r)
 	if err != nil {

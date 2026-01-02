@@ -179,7 +179,6 @@ func (p *Provider) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	q.Set("state", state)
 	authURL.RawQuery = q.Encode()
 
-	slog.Info("Redirecting to OIDC provider", "url", authURL.String())
 	http.Redirect(w, r, authURL.String(), http.StatusFound)
 }
 
