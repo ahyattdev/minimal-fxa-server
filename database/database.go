@@ -31,6 +31,7 @@ type AuthCode struct {
 	State               string
 	KeysJWK             string
 	UserID              string `gorm:"index"`
+	Email               string // User's email address
 	CreatedAt           time.Time
 	ExpiresAt           time.Time
 }
@@ -62,6 +63,7 @@ type Session struct {
 // User represents a Firefox Account user
 type User struct {
 	ID            string `gorm:"primaryKey"` // MD5 hash of username/email
+	Email         string `gorm:"index"`      // User's email address
 	KeysChangedAt int64  // Unix timestamp, set once on first login, used in JWT fxa-generation
 	CreatedAt     time.Time
 }

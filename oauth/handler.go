@@ -144,6 +144,7 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 		State:               state,
 		KeysJWK:             r.FormValue("keys_jwk"),
 		UserID:              userID,
+		Email:               email,
 		CreatedAt:           time.Now(),
 		ExpiresAt:           time.Now().Add(10 * time.Minute),
 	}
@@ -336,6 +337,7 @@ func (h *Handler) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		State:               state,
 		KeysJWK:             params.Get("keys_jwk"),
 		UserID:              userID,
+		Email:               user.Email,
 		CreatedAt:           time.Now(),
 		ExpiresAt:           time.Now().Add(10 * time.Minute),
 	}
@@ -495,7 +497,7 @@ func (h *Handler) handleToken(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Get or create user to get stable keysChangedAt
-		keysChangedAt, err := h.getOrCreateUser(tx, authCode.UserID)
+		keysChangedAt, err := h.getOrCreateUser(tx, authCode.UserID, authCode.Email)
 		if err != nil {
 			return fmt.Errorf("failed to get/create user: %w", err)
 		}
@@ -685,10 +687,14 @@ func bigIntToBytes(e int) []byte {
 }
 
 // getOrCreateUser ensures a user exists and returns their keysChangedAt timestamp
-func (h *Handler) getOrCreateUser(tx *gorm.DB, userID string) (int64, error) {
+func (h *Handler) getOrCreateUser(tx *gorm.DB, userID, email string) (int64, error) {
 	var user database.User
 	result := tx.Where("id = ?", userID).First(&user)
 	if result.Error == nil {
+		// Update email if it was empty (for existing users)
+		if user.Email == "" && email != "" {
+			tx.Model(&user).Update("email", email)
+		}
 		return user.KeysChangedAt, nil
 	}
 	if result.Error != gorm.ErrRecordNotFound {
@@ -698,13 +704,14 @@ func (h *Handler) getOrCreateUser(tx *gorm.DB, userID string) (int64, error) {
 	// User doesn't exist, create with current timestamp as keysChangedAt
 	user = database.User{
 		ID:            userID,
+		Email:         email,
 		KeysChangedAt: time.Now().Unix(),
 		CreatedAt:     time.Now(),
 	}
 	if err := tx.Create(&user).Error; err != nil {
 		return 0, err
 	}
-	slog.Info("Created new user", "userID", userID, "keysChangedAt", user.KeysChangedAt)
+	slog.Info("Created new user", "userID", userID, "email", email, "keysChangedAt", user.KeysChangedAt)
 	return user.KeysChangedAt, nil
 }
 
@@ -770,12 +777,16 @@ func (h *Handler) getUserFromRequest(r *http.Request) (userID, email string, err
 		claims, err := h.verifyAccessToken(accessToken)
 		if err == nil {
 			userID, _ = claims["sub"].(string)
-			// Get email from database using user ID
+			// Get email from User table
+			var user database.User
+			if dbErr := h.db.Where("id = ?", userID).First(&user).Error; dbErr == nil && user.Email != "" {
+				return userID, user.Email, nil
+			}
+			// Fallback: check LocalUser table
 			var localUser database.LocalUser
 			if dbErr := h.db.Where("id = ?", userID).First(&localUser).Error; dbErr == nil {
 				return userID, localUser.Email, nil
 			}
-			// Fallback: construct email from user ID for OIDC users
 			return userID, userID + "@user", nil
 		}
 
@@ -785,7 +796,12 @@ func (h *Handler) getUserFromRequest(r *http.Request) (userID, email string, err
 			return "", "", fmt.Errorf("invalid token")
 		}
 
-		// Get email from LocalUser table
+		// Get email from User table
+		var user database.User
+		if dbErr := h.db.Where("id = ?", token.UserID).First(&user).Error; dbErr == nil && user.Email != "" {
+			return token.UserID, user.Email, nil
+		}
+		// Fallback: check LocalUser table
 		var localUser database.LocalUser
 		if dbErr := h.db.Where("id = ?", token.UserID).First(&localUser).Error; dbErr == nil {
 			return token.UserID, localUser.Email, nil
@@ -838,7 +854,12 @@ func (h *Handler) getUserFromHawkAuth(r *http.Request) (userID, email string, er
 	// Update last access time
 	h.db.Model(&session).Update("last_access_at", time.Now())
 
-	// Get email from LocalUser table
+	// Get email from User table
+	var user database.User
+	if dbErr := h.db.Where("id = ?", session.UserID).First(&user).Error; dbErr == nil && user.Email != "" {
+		return session.UserID, user.Email, nil
+	}
+	// Fallback: check LocalUser table
 	var localUser database.LocalUser
 	if dbErr := h.db.Where("id = ?", session.UserID).First(&localUser).Error; dbErr == nil {
 		return session.UserID, localUser.Email, nil
@@ -898,7 +919,7 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 	// Handle fxa-credentials grant type (Mozilla-specific)
 	// Firefox uses this to get access tokens using session credentials
 	if req.GrantType == "fxa-credentials" {
-		userID, _, err := h.getUserFromRequest(r)
+		userID, email, err := h.getUserFromRequest(r)
 		if err != nil {
 			slog.Warn("fxa-credentials: failed to get user from request", "error", err)
 			w.Header().Set("Content-Type", "application/json")
@@ -922,7 +943,7 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 		var oauthToken *database.OAuthToken
 		err = h.db.Transaction(func(tx *gorm.DB) error {
 			// Get or create user to get stable keysChangedAt
-			keysChangedAt, err := h.getOrCreateUser(tx, userID)
+			keysChangedAt, err := h.getOrCreateUser(tx, userID, email)
 			if err != nil {
 				return fmt.Errorf("failed to get/create user: %w", err)
 			}
@@ -993,7 +1014,8 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Get or create user to get stable keysChangedAt
-			keysChangedAt, err := h.getOrCreateUser(tx, existingToken.UserID)
+			// Note: email is empty here but user should already exist from initial token creation
+			keysChangedAt, err := h.getOrCreateUser(tx, existingToken.UserID, "")
 			if err != nil {
 				return fmt.Errorf("failed to get/create user: %w", err)
 			}
@@ -1058,7 +1080,7 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Get or create user to get stable keysChangedAt
-		keysChangedAt, err := h.getOrCreateUser(tx, authCode.UserID)
+		keysChangedAt, err := h.getOrCreateUser(tx, authCode.UserID, authCode.Email)
 		if err != nil {
 			return fmt.Errorf("failed to get/create user: %w", err)
 		}
