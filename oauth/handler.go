@@ -13,6 +13,7 @@ import (
 	"html/template"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -59,6 +60,7 @@ func NewHandler(baseURL string, authProvider auth.Provider, db *gorm.DB, private
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /{$}", h.handleAuthorizePage)
 	mux.HandleFunc("POST /{$}", h.handleLogin)
+	mux.HandleFunc("GET /oidc/callback", h.handleOIDCCallback)
 	mux.HandleFunc("POST /oauth/v1/token", h.handleToken)
 	mux.HandleFunc("POST /oauth/v1/verify", h.handleVerify)
 	mux.HandleFunc("GET /oauth/v1/jwks", h.handleJWKS)
@@ -80,6 +82,23 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 }
 
 func (h *Handler) handleAuthorizePage(w http.ResponseWriter, r *http.Request) {
+	// For OIDC, redirect to the identity provider
+	if h.authProvider.Type() == "oidc" {
+		// Store OAuth params in cookie for after OIDC callback
+		http.SetCookie(w, &http.Cookie{
+			Name:     "fxa_oauth_params",
+			Value:    base64.RawURLEncoding.EncodeToString([]byte(r.URL.RawQuery)),
+			Path:     "/",
+			HttpOnly: true,
+			Secure:   isSecureRequest(r),
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   600, // 10 minutes
+		})
+		h.authProvider.HandleLogin(w, r)
+		return
+	}
+
+	// For local auth, show the login form
 	data := map[string]string{
 		"ClientID":            r.URL.Query().Get("client_id"),
 		"State":               r.URL.Query().Get("state"),
@@ -238,6 +257,182 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
   sendWebChannel('fxaccounts:login', loginData);
   
   // Fallback: if login doesn't get acknowledged within 2 seconds, try OAuth anyway
+  setTimeout(function() {
+    if (!loginAcknowledged) {
+      console.log('[FxA] Login not acknowledged, trying OAuth anyway');
+      sendWebChannel('fxaccounts:oauth_login', oauthData);
+    }
+  }, 2000);
+})();
+</script>
+</body>
+</html>`
+	w.Write([]byte(html))
+}
+
+func (h *Handler) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
+	// Get the user from OIDC provider
+	user, err := h.authProvider.HandleCallback(w, r)
+	if err != nil {
+		slog.Error("OIDC callback failed", "error", err)
+		http.Error(w, "Authentication failed: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	// Retrieve stored OAuth params from cookie
+	cookie, err := r.Cookie("fxa_oauth_params")
+	if err != nil {
+		slog.Error("Missing OAuth params cookie")
+		http.Error(w, "Session expired, please try again", http.StatusBadRequest)
+		return
+	}
+
+	// Clear the cookie
+	http.SetCookie(w, &http.Cookie{
+		Name:   "fxa_oauth_params",
+		Value:  "",
+		Path:   "/",
+		MaxAge: -1,
+	})
+
+	paramsBytes, err := base64.RawURLEncoding.DecodeString(cookie.Value)
+	if err != nil {
+		slog.Error("Invalid OAuth params cookie", "error", err)
+		http.Error(w, "Invalid session", http.StatusBadRequest)
+		return
+	}
+
+	params, err := url.ParseQuery(string(paramsBytes))
+	if err != nil {
+		slog.Error("Failed to parse OAuth params", "error", err)
+		http.Error(w, "Invalid session", http.StatusBadRequest)
+		return
+	}
+
+	// Generate OAuth authorization code
+	code := generateHexString(64)
+	state := params.Get("state")
+	userID := user.ID
+
+	slog.Info("OIDC user authenticated, generated auth code", "email", user.Email)
+
+	// Store the auth code in database
+	authCode := &database.AuthCode{
+		Code:                code,
+		ClientID:            params.Get("client_id"),
+		CodeChallenge:       params.Get("code_challenge"),
+		CodeChallengeMethod: params.Get("code_challenge_method"),
+		State:               state,
+		KeysJWK:             params.Get("keys_jwk"),
+		UserID:              userID,
+		CreatedAt:           time.Now(),
+		ExpiresAt:           time.Now().Add(10 * time.Minute),
+	}
+	if err := h.db.Create(authCode).Error; err != nil {
+		slog.Error("Failed to store auth code", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Generate a session token
+	sessionToken := generateHexString(64)
+
+	// Store session in database
+	session := &database.Session{
+		ID:           sessionToken,
+		UserID:       userID,
+		CreatedAt:    time.Now(),
+		LastAccessAt: time.Now(),
+	}
+	if err := h.db.Create(session).Error; err != nil {
+		slog.Error("Failed to store session", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Prepare OAuth data
+	oauthData := map[string]any{
+		"code":                code,
+		"state":               state,
+		"redirect":            "web",
+		"action":              "signin",
+		"uid":                 userID,
+		"email":               user.Email,
+		"verified":            user.Verified,
+		"sessionToken":        sessionToken,
+		"declinedSyncEngines": []string{},
+		"offeredSyncEngines":  []string{"bookmarks", "history", "passwords", "tabs", "addons", "preferences"},
+	}
+	oauthJSON, _ := json.Marshal(oauthData)
+
+	// Prepare login data
+	loginData := map[string]any{
+		"uid":          userID,
+		"email":        user.Email,
+		"sessionToken": sessionToken,
+		"verified":     user.Verified,
+	}
+	loginJSON, _ := json.Marshal(loginData)
+
+	// Return page with WebChannel message
+	w.Header().Set("Content-Type", "text/html")
+	html := `<!DOCTYPE html>
+<html>
+<head><title>Signing in...</title></head>
+<body>
+<p id="status">Signing in...</p>
+<script>
+(function() {
+  const status = document.getElementById('status');
+  const loginData = ` + string(loginJSON) + `;
+  const oauthData = ` + string(oauthJSON) + `;
+  
+  function sendWebChannel(command, payload, messageId) {
+    if (!messageId) {
+      messageId = Date.now().toString(36) + '-' + Math.random().toString(36).substr(2);
+    }
+    const detail = {
+      id: 'account_updates',
+      message: {
+        command: command,
+        messageId: messageId,
+        data: payload
+      }
+    };
+    console.log('[FxA] Sending:', command, detail);
+    window.dispatchEvent(new CustomEvent('WebChannelMessageToChrome', {
+      detail: JSON.stringify(detail)
+    }));
+    return messageId;
+  }
+  
+  let loginAcknowledged = false;
+  
+  window.addEventListener('WebChannelMessageToContent', function(e) {
+    console.log('[FxA] Received from Firefox:', e.detail);
+    let detail = e.detail;
+    if (typeof detail === 'string') {
+      try { detail = JSON.parse(detail); } catch(err) { return; }
+    }
+    const cmd = detail.message?.command;
+    const msgId = detail.message?.messageId;
+    const data = detail.message?.data;
+    
+    if (cmd === 'fxaccounts:can_link_account') {
+      sendWebChannel('fxaccounts:can_link_account', { ok: true }, msgId);
+    } else if (cmd === 'fxaccounts:login' && !data?.error) {
+      console.log('[FxA] Login acknowledged, sending OAuth login');
+      loginAcknowledged = true;
+      sendWebChannel('fxaccounts:oauth_login', oauthData);
+    } else if (cmd === 'fxaccounts:oauth_login' && !data?.error) {
+      status.textContent = 'Sign-in complete! You can close this tab.';
+    }
+  });
+  
+  status.textContent = 'Setting up account...';
+  console.log('[FxA] Sending login data:', loginData);
+  sendWebChannel('fxaccounts:login', loginData);
+  
   setTimeout(function() {
     if (!loginAcknowledged) {
       console.log('[FxA] Login not acknowledged, trying OAuth anyway');
@@ -1225,6 +1420,16 @@ func (h *Handler) handleProfile(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+// isSecureRequest checks if the request came over HTTPS (directly or via reverse proxy)
+func isSecureRequest(r *http.Request) bool {
+	// Check X-Forwarded-Proto header (set by reverse proxies)
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		return proto == "https"
+	}
+	// Fall back to checking TLS directly
+	return r.TLS != nil
 }
 
 func generateRandomString(length int) string {

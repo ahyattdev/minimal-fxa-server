@@ -73,6 +73,13 @@ type LocalUser struct {
 	UpdatedAt    time.Time
 }
 
+// OIDCState stores OIDC state tokens for CSRF protection
+type OIDCState struct {
+	State     string `gorm:"primaryKey"`
+	CreatedAt time.Time
+	ExpiresAt time.Time
+}
+
 // Connect initializes the database connection and runs migrations
 func Connect(databaseURI string) (*gorm.DB, error) {
 	db, err := gorm.Open(postgres.Open(databaseURI), &gorm.Config{
@@ -85,7 +92,7 @@ func Connect(databaseURI string) (*gorm.DB, error) {
 	slog.Info("Connected to database")
 
 	// Auto-migrate schemas
-	err = db.AutoMigrate(&Device{}, &AuthCode{}, &OAuthToken{}, &Session{}, &User{}, &LocalUser{})
+	err = db.AutoMigrate(&Device{}, &AuthCode{}, &OAuthToken{}, &Session{}, &User{}, &LocalUser{}, &OIDCState{})
 	if err != nil {
 		return nil, err
 	}
@@ -132,5 +139,11 @@ func cleanup(db *gorm.DB) {
 	result = db.Where("last_access_at < ?", staleThreshold).Delete(&Session{})
 	if result.RowsAffected > 0 {
 		slog.Info("Cleaned up stale sessions", "count", result.RowsAffected)
+	}
+
+	// Delete expired OIDC states
+	result = db.Where("expires_at < ?", now).Delete(&OIDCState{})
+	if result.RowsAffected > 0 {
+		slog.Info("Cleaned up expired OIDC states", "count", result.RowsAffected)
 	}
 }

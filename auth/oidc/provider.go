@@ -16,25 +16,23 @@ import (
 	"time"
 
 	"github.com/ahyattdev/minimal-fxa-server/auth"
+	"github.com/ahyattdev/minimal-fxa-server/database"
+	"gorm.io/gorm"
 )
 
 // Provider implements OIDC authentication
 type Provider struct {
 	config    Config
 	client    *http.Client
+	db        *gorm.DB
 	oidcMeta  *OIDCMetadata
 	metaMutex sync.RWMutex
-	states    map[string]stateData // CSRF state storage
-	stateMu   sync.Mutex
-}
-
-type stateData struct {
-	RedirectURI string
-	CreatedAt   time.Time
 }
 
 // Config holds OIDC provider configuration
 type Config struct {
+	// DB is the database connection for storing OIDC states
+	DB *gorm.DB
 	// IssuerURL is the OIDC issuer URL (e.g., https://accounts.google.com)
 	IssuerURL string
 	// ClientID is the OAuth client ID
@@ -45,8 +43,6 @@ type Config struct {
 	RedirectURL string
 	// Scopes to request (default: openid email profile)
 	Scopes []string
-	// OnSuccess is called after successful authentication
-	OnSuccess func(w http.ResponseWriter, r *http.Request, user *auth.User)
 }
 
 // OIDCMetadata holds the discovered OIDC configuration
@@ -77,6 +73,9 @@ type UserInfo struct {
 
 // NewProvider creates a new OIDC authentication provider
 func NewProvider(cfg Config) (*Provider, error) {
+	if cfg.DB == nil {
+		return nil, fmt.Errorf("database connection is required")
+	}
 	if cfg.IssuerURL == "" {
 		return nil, fmt.Errorf("OIDC issuer URL is required")
 	}
@@ -94,16 +93,13 @@ func NewProvider(cfg Config) (*Provider, error) {
 	p := &Provider{
 		config: cfg,
 		client: &http.Client{Timeout: 10 * time.Second},
-		states: make(map[string]stateData),
+		db:     cfg.DB,
 	}
 
 	// Discover OIDC metadata
 	if err := p.discover(); err != nil {
 		return nil, fmt.Errorf("OIDC discovery failed: %w", err)
 	}
-
-	// Start state cleanup goroutine
-	go p.cleanupStates()
 
 	return p, nil
 }
@@ -135,22 +131,6 @@ func (p *Provider) discover() error {
 	return nil
 }
 
-// cleanupStates removes expired states
-func (p *Provider) cleanupStates() {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		p.stateMu.Lock()
-		for state, data := range p.states {
-			if time.Since(data.CreatedAt) > 10*time.Minute {
-				delete(p.states, state)
-			}
-		}
-		p.stateMu.Unlock()
-	}
-}
-
 // Type returns the provider type
 func (p *Provider) Type() string {
 	return "oidc"
@@ -177,13 +157,17 @@ func (p *Provider) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	rand.Read(stateBytes)
 	state := base64.RawURLEncoding.EncodeToString(stateBytes)
 
-	// Store state with redirect info
-	p.stateMu.Lock()
-	p.states[state] = stateData{
-		RedirectURI: r.URL.Query().Get("redirect_uri"),
-		CreatedAt:   time.Now(),
+	// Store state in database for CSRF protection
+	oidcState := &database.OIDCState{
+		State:     state,
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(10 * time.Minute),
 	}
-	p.stateMu.Unlock()
+	if err := p.db.Create(oidcState).Error; err != nil {
+		slog.Error("Failed to store OIDC state", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 
 	// Build authorization URL
 	authURL, _ := url.Parse(meta.AuthorizationEndpoint)
@@ -214,17 +198,14 @@ func (p *Provider) HandleCallback(w http.ResponseWriter, r *http.Request) (*auth
 		return nil, fmt.Errorf("missing authorization code")
 	}
 
-	// Verify state
-	p.stateMu.Lock()
-	_, stateValid := p.states[state]
-	if stateValid {
-		delete(p.states, state)
+	// Verify and consume state from database
+	var oidcState database.OIDCState
+	result := p.db.Where("state = ? AND expires_at > ?", state, time.Now()).First(&oidcState)
+	if result.Error != nil {
+		return nil, fmt.Errorf("invalid or expired state parameter")
 	}
-	p.stateMu.Unlock()
-
-	if !stateValid {
-		return nil, fmt.Errorf("invalid state parameter")
-	}
+	// Delete the state to prevent reuse
+	p.db.Delete(&oidcState)
 
 	p.metaMutex.RLock()
 	meta := p.oidcMeta

@@ -143,6 +143,7 @@ func main() {
 		}
 
 		provider, err := oidc.NewProvider(oidc.Config{
+			DB:           db,
 			IssuerURL:    oidcIssuer,
 			ClientID:     oidcClientID,
 			ClientSecret: oidcClientSecret,
