@@ -5,6 +5,7 @@ go 1.25.5
 require (
 	github.com/SherClockHolmes/webpush-go v1.4.0
 	github.com/golang-jwt/jwt/v5 v5.3.0
+	github.com/hiyosi/hawk v1.0.1
 	golang.org/x/crypto v0.44.0
 	golang.org/x/term v0.37.0
 	google.golang.org/grpc v1.78.0

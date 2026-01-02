@@ -50,7 +50,9 @@ type OAuthToken struct {
 
 // Session represents a user session
 type Session struct {
-	ID           string `gorm:"primaryKey"`
+	ID           string `gorm:"primaryKey"`  // The raw sessionToken (hex)
+	TokenID      string `gorm:"uniqueIndex"` // Derived Hawk tokenId (hex) - used for Hawk auth lookup
+	HawkKey      []byte `gorm:"not null"`    // Derived reqHMACkey for Hawk MAC verification
 	UserID       string `gorm:"index;not null"`
 	DeviceID     *string
 	CreatedAt    time.Time

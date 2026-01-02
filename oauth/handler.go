@@ -21,6 +21,7 @@ import (
 	"github.com/ahyattdev/minimal-fxa-server/auth"
 	"github.com/ahyattdev/minimal-fxa-server/database"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/hiyosi/hawk"
 	"gorm.io/gorm"
 )
 
@@ -152,12 +153,22 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate a session token for this login
+	// Generate a session token for this login (32 bytes = 64 hex chars)
 	sessionToken := generateHexString(64)
 
-	// Store session in database
+	// Derive Hawk credentials from sessionToken
+	tokenID, hawkKey, err := DeriveHawkCredentialsFromHex(sessionToken)
+	if err != nil {
+		slog.Error("Failed to derive Hawk credentials", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Store session in database with Hawk credentials
 	session := &database.Session{
 		ID:           sessionToken,
+		TokenID:      tokenID,
+		HawkKey:      hawkKey,
 		UserID:       userID,
 		CreatedAt:    time.Now(),
 		LastAccessAt: time.Now(),
@@ -334,12 +345,22 @@ func (h *Handler) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate a session token
+	// Generate a session token (32 bytes = 64 hex chars)
 	sessionToken := generateHexString(64)
 
-	// Store session in database
+	// Derive Hawk credentials from sessionToken
+	tokenID, hawkKey, err := DeriveHawkCredentialsFromHex(sessionToken)
+	if err != nil {
+		slog.Error("Failed to derive Hawk credentials", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Store session in database with Hawk credentials
 	session := &database.Session{
 		ID:           sessionToken,
+		TokenID:      tokenID,
+		HawkKey:      hawkKey,
 		UserID:       userID,
 		CreatedAt:    time.Now(),
 		LastAccessAt: time.Now(),
@@ -732,40 +753,95 @@ func (h *Handler) verifyAccessToken(tokenString string) (jwt.MapClaims, error) {
 }
 
 // getUserFromRequest extracts user ID and email from the Authorization header
+// Supports both Bearer tokens and Hawk authentication
 func (h *Handler) getUserFromRequest(r *http.Request) (userID, email string, err error) {
 	authHeader := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authHeader, "Bearer ") {
-		return "", "", fmt.Errorf("missing or invalid Authorization header")
+
+	// Try Hawk authentication first (used by Firefox for session-based requests)
+	if strings.HasPrefix(authHeader, "Hawk ") {
+		return h.getUserFromHawkAuth(r)
 	}
 
-	accessToken := strings.TrimPrefix(authHeader, "Bearer ")
+	// Try Bearer token authentication
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		accessToken := strings.TrimPrefix(authHeader, "Bearer ")
 
-	// Try JWT verification first
-	claims, err := h.verifyAccessToken(accessToken)
-	if err == nil {
-		userID, _ = claims["sub"].(string)
-		// Get email from database using user ID
-		var localUser database.LocalUser
-		if dbErr := h.db.Where("id = ?", userID).First(&localUser).Error; dbErr == nil {
-			return userID, localUser.Email, nil
+		// Try JWT verification first
+		claims, err := h.verifyAccessToken(accessToken)
+		if err == nil {
+			userID, _ = claims["sub"].(string)
+			// Get email from database using user ID
+			var localUser database.LocalUser
+			if dbErr := h.db.Where("id = ?", userID).First(&localUser).Error; dbErr == nil {
+				return userID, localUser.Email, nil
+			}
+			// Fallback: construct email from user ID for OIDC users
+			return userID, userID + "@user", nil
 		}
-		// Fallback: construct email from user ID for OIDC users
-		return userID, userID + "@user", nil
+
+		// Fallback to database lookup for opaque tokens
+		var token database.OAuthToken
+		if err := h.db.Where("access_token = ?", accessToken).First(&token).Error; err != nil {
+			return "", "", fmt.Errorf("invalid token")
+		}
+
+		// Get email from LocalUser table
+		var localUser database.LocalUser
+		if dbErr := h.db.Where("id = ?", token.UserID).First(&localUser).Error; dbErr == nil {
+			return token.UserID, localUser.Email, nil
+		}
+
+		return token.UserID, token.UserID + "@user", nil
 	}
 
-	// Fallback to database lookup for opaque tokens
-	var token database.OAuthToken
-	if err := h.db.Where("access_token = ?", accessToken).First(&token).Error; err != nil {
-		return "", "", fmt.Errorf("invalid token")
+	return "", "", fmt.Errorf("missing or invalid Authorization header")
+}
+
+// getUserFromHawkAuth verifies Hawk authentication and returns the user
+func (h *Handler) getUserFromHawkAuth(r *http.Request) (userID, email string, err error) {
+	// Use the hawk library for proper verification
+	hawkServer := hawk.NewServer(&hawkCredentialStore{db: h.db})
+
+	cred, err := hawkServer.Authenticate(r)
+	if err != nil {
+		return "", "", fmt.Errorf("hawk authentication failed: %w", err)
 	}
+
+	// Look up session by tokenId to get userId
+	var session database.Session
+	if err := h.db.Where("token_id = ?", cred.ID).First(&session).Error; err != nil {
+		return "", "", fmt.Errorf("session not found for token")
+	}
+
+	// Update last access time
+	h.db.Model(&session).Update("last_access_at", time.Now())
 
 	// Get email from LocalUser table
 	var localUser database.LocalUser
-	if dbErr := h.db.Where("id = ?", token.UserID).First(&localUser).Error; dbErr == nil {
-		return token.UserID, localUser.Email, nil
+	if dbErr := h.db.Where("id = ?", session.UserID).First(&localUser).Error; dbErr == nil {
+		return session.UserID, localUser.Email, nil
 	}
 
-	return token.UserID, token.UserID + "@user", nil
+	return session.UserID, session.UserID + "@user", nil
+}
+
+// hawkCredentialStore implements hawk.CredentialStore interface
+type hawkCredentialStore struct {
+	db *gorm.DB
+}
+
+// GetCredential retrieves Hawk credentials for a given tokenId
+func (s *hawkCredentialStore) GetCredential(id string) (*hawk.Credential, error) {
+	var session database.Session
+	if err := s.db.Where("token_id = ?", id).First(&session).Error; err != nil {
+		return nil, fmt.Errorf("unknown credential id")
+	}
+
+	return &hawk.Credential{
+		ID:  id,
+		Key: string(session.HawkKey),
+		Alg: hawk.SHA256,
+	}, nil
 }
 
 func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
