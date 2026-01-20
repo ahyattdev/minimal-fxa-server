@@ -190,6 +190,7 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	// Prepare OAuth data (for fxaccounts:oauth_login)
 	// Firefox expects these fields for OAuth login
+	clientID := r.FormValue("client_id")
 	oauthData := map[string]any{
 		"code":                code,
 		"state":               state,
@@ -199,6 +200,7 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 		"email":               user.Email,
 		"verified":            user.Verified,
 		"sessionToken":        sessionToken,
+		"clientId":            clientID,
 		"declinedSyncEngines": []string{},
 		"offeredSyncEngines":  []string{"bookmarks", "history", "passwords", "tabs", "addons", "preferences"},
 	}
@@ -259,14 +261,42 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
     
     if (cmd === 'fxaccounts:can_link_account') {
       sendWebChannel('fxaccounts:can_link_account', { ok: true }, msgId);
-    } else if (cmd === 'fxaccounts:login' && !data?.error) {
-      // Firefox acknowledged the login, now send OAuth
-      console.log('[FxA] Login acknowledged, sending OAuth login');
-      loginAcknowledged = true;
-      sendWebChannel('fxaccounts:oauth_login', oauthData);
-      console.log('[FxA] OAuth login sent with data:', oauthData);
-    } else if (cmd === 'fxaccounts:oauth_login' && !data?.error) {
-      status.textContent = 'Sign-in complete! You can close this tab.';
+    } else if (cmd === 'fxaccounts:login') {
+      if (data?.error) {
+        console.error('[FxA] Login error from Firefox:', data.error);
+        status.textContent = 'Login error: ' + (data.error.message || JSON.stringify(data.error));
+      } else {
+        // Firefox acknowledged the login, now send OAuth
+        console.log('[FxA] Login acknowledged, sending OAuth login');
+        console.log('[FxA] OAuth data to send:', JSON.stringify(oauthData, null, 2));
+        loginAcknowledged = true;
+        sendWebChannel('fxaccounts:oauth_login', oauthData);
+        console.log('[FxA] OAuth login sent');
+      }
+    } else if (cmd === 'fxaccounts:oauth_login') {
+      if (data?.error) {
+        console.error('[FxA] OAuth login error from Firefox:', data.error);
+        // Try to extract error message from various possible formats
+        let errorMsg = 'Unknown error';
+        if (typeof data.error === 'string') {
+          errorMsg = data.error;
+        } else if (data.error.message) {
+          errorMsg = data.error.message;
+          // If message is "[object Object]", try to get more details
+          if (errorMsg === '[object Object]' && data.error.error) {
+            errorMsg = typeof data.error.error === 'string' ? data.error.error : JSON.stringify(data.error.error);
+          }
+        } else if (data.error.error) {
+          errorMsg = typeof data.error.error === 'string' ? data.error.error : JSON.stringify(data.error.error);
+        } else {
+          errorMsg = JSON.stringify(data.error);
+        }
+        status.textContent = 'OAuth error: ' + errorMsg;
+        console.error('[FxA] Full error object:', JSON.stringify(data.error, null, 2));
+        console.error('[FxA] Full response data:', JSON.stringify(data, null, 2));
+      } else {
+        status.textContent = 'Sign-in complete! You can close this tab.';
+      }
     }
   });
   
@@ -382,6 +412,7 @@ func (h *Handler) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Prepare OAuth data
+	clientID := params.Get("client_id")
 	oauthData := map[string]any{
 		"code":                code,
 		"state":               state,
@@ -391,6 +422,7 @@ func (h *Handler) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		"email":               user.Email,
 		"verified":            user.Verified,
 		"sessionToken":        sessionToken,
+		"clientId":            clientID,
 		"declinedSyncEngines": []string{},
 		"offeredSyncEngines":  []string{"bookmarks", "history", "passwords", "tabs", "addons", "preferences"},
 	}
@@ -451,12 +483,41 @@ func (h *Handler) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
     
     if (cmd === 'fxaccounts:can_link_account') {
       sendWebChannel('fxaccounts:can_link_account', { ok: true }, msgId);
-    } else if (cmd === 'fxaccounts:login' && !data?.error) {
-      console.log('[FxA] Login acknowledged, sending OAuth login');
-      loginAcknowledged = true;
-      sendWebChannel('fxaccounts:oauth_login', oauthData);
-    } else if (cmd === 'fxaccounts:oauth_login' && !data?.error) {
-      status.textContent = 'Sign-in complete! You can close this tab.';
+    } else if (cmd === 'fxaccounts:login') {
+      if (data?.error) {
+        console.error('[FxA] Login error from Firefox:', data.error);
+        status.textContent = 'Login error: ' + (data.error.message || JSON.stringify(data.error));
+      } else {
+        console.log('[FxA] Login acknowledged, sending OAuth login');
+        console.log('[FxA] OAuth data to send:', JSON.stringify(oauthData, null, 2));
+        loginAcknowledged = true;
+        sendWebChannel('fxaccounts:oauth_login', oauthData);
+        console.log('[FxA] OAuth login sent');
+      }
+    } else if (cmd === 'fxaccounts:oauth_login') {
+      if (data?.error) {
+        console.error('[FxA] OAuth login error from Firefox:', data.error);
+        // Try to extract error message from various possible formats
+        let errorMsg = 'Unknown error';
+        if (typeof data.error === 'string') {
+          errorMsg = data.error;
+        } else if (data.error.message) {
+          errorMsg = data.error.message;
+          // If message is "[object Object]", try to get more details
+          if (errorMsg === '[object Object]' && data.error.error) {
+            errorMsg = typeof data.error.error === 'string' ? data.error.error : JSON.stringify(data.error.error);
+          }
+        } else if (data.error.error) {
+          errorMsg = typeof data.error.error === 'string' ? data.error.error : JSON.stringify(data.error.error);
+        } else {
+          errorMsg = JSON.stringify(data.error);
+        }
+        status.textContent = 'OAuth error: ' + errorMsg;
+        console.error('[FxA] Full error object:', JSON.stringify(data.error, null, 2));
+        console.error('[FxA] Full response data:', JSON.stringify(data, null, 2));
+      } else {
+        status.textContent = 'Sign-in complete! You can close this tab.';
+      }
     }
   });
   
