@@ -487,6 +487,7 @@ func (h *Handler) handleToken(w http.ResponseWriter, r *http.Request) {
 
 	var authCode database.AuthCode
 	var oauthToken *database.OAuthToken
+	var keysChangedAt int64
 	refreshToken := generateRandomString(64)
 	scope := "https://identity.mozilla.com/apps/oldsync profile"
 	expiresAt := time.Now().Add(time.Hour)
@@ -505,7 +506,8 @@ func (h *Handler) handleToken(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Get or create user to get stable keysChangedAt
-		keysChangedAt, err := h.getOrCreateUser(tx, authCode.UserID, authCode.Email)
+		var err error
+		keysChangedAt, err = h.getOrCreateUser(tx, authCode.UserID, authCode.Email)
 		if err != nil {
 			return fmt.Errorf("failed to get/create user: %w", err)
 		}
@@ -551,7 +553,7 @@ func (h *Handler) handleToken(w http.ResponseWriter, r *http.Request) {
 
 	// Generate keys_jwe if keys_jwk was provided
 	if authCode.KeysJWK != "" {
-		keysJWE, err := generateScopedKeysJWE(authCode.KeysJWK)
+		keysJWE, err := generateScopedKeysJWE(authCode.KeysJWK, authCode.UserID, keysChangedAt)
 		if err != nil {
 			slog.Warn("Failed to generate keys_jwe", "error", err)
 		} else {
@@ -559,7 +561,7 @@ func (h *Handler) handleToken(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	slog.Info("Token issued (JWT)", "client_id", oauthToken.ClientID)
+	slog.Info("Token issued (JWT)", "client_id", oauthToken.ClientID, "keysChangedAt", keysChangedAt)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
@@ -1004,6 +1006,7 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 
 	var authCode database.AuthCode
 	var oauthToken *database.OAuthToken
+	var keysChangedAt int64
 	refreshToken := generateRandomString(64)
 	scope := "https://identity.mozilla.com/apps/oldsync profile"
 	expiresAt := time.Now().Add(time.Hour)
@@ -1021,7 +1024,8 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Get or create user to get stable keysChangedAt
-		keysChangedAt, err := h.getOrCreateUser(tx, authCode.UserID, authCode.Email)
+		var err error
+		keysChangedAt, err = h.getOrCreateUser(tx, authCode.UserID, authCode.Email)
 		if err != nil {
 			return fmt.Errorf("failed to get/create user: %w", err)
 		}
@@ -1063,7 +1067,7 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 
 	// Generate keys_jwe if keys_jwk was provided
 	if authCode.KeysJWK != "" {
-		keysJWE, err := generateScopedKeysJWE(authCode.KeysJWK)
+		keysJWE, err := generateScopedKeysJWE(authCode.KeysJWK, authCode.UserID, keysChangedAt)
 		if err != nil {
 			slog.Warn("Failed to generate keys_jwe", "error", err)
 		} else {
@@ -1071,7 +1075,7 @@ func (h *Handler) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	slog.Info("Token issued (JWT)", "client_id", oauthToken.ClientID)
+	slog.Info("Token issued (JWT)", "client_id", oauthToken.ClientID, "keysChangedAt", keysChangedAt)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
@@ -1517,7 +1521,9 @@ func base64URLDecode(s string) ([]byte, error) {
 }
 
 // generateScopedKeysJWE creates a JWE containing scoped keys encrypted with the client's public key
-func generateScopedKeysJWE(keysJWKBase64 string) (string, error) {
+// userID and keysChangedAt are used to derive stable keys - the same user gets the same sync key
+// keysChangedAt must match the fxa-generation claim in the JWT token
+func generateScopedKeysJWE(keysJWKBase64 string, userID string, keysChangedAt int64) (string, error) {
 	if keysJWKBase64 == "" {
 		return "", fmt.Errorf("no keys_jwk provided")
 	}
@@ -1597,17 +1603,23 @@ func generateScopedKeysJWE(keysJWKBase64 string) (string, error) {
 	derivedKeyHash := sha256.Sum256(kdfInput)
 	derivedKey := derivedKeyHash[:32]
 
-	// Generate random sync key for the scoped keys
+	// Derive deterministic sync key from userID and keysChangedAt
+	// This ensures the same user always gets the same sync key (until keysChangedAt changes)
 	// Must be 64 bytes: first 32 for encryption, last 32 for HMAC
+	keyMaterial := fmt.Sprintf("%s:%d:sync-key-material", userID, keysChangedAt)
+	syncKeyHash1 := sha256.Sum256([]byte(keyMaterial + ":part1"))
+	syncKeyHash2 := sha256.Sum256([]byte(keyMaterial + ":part2"))
 	syncKey := make([]byte, 64)
-	rand.Read(syncKey)
+	copy(syncKey[:32], syncKeyHash1[:])
+	copy(syncKey[32:], syncKeyHash2[:])
 
-	// Generate key fingerprint (random bytes, base64url encoded)
-	fingerprint := make([]byte, 16)
-	rand.Read(fingerprint)
+	// Derive deterministic fingerprint from userID and keysChangedAt
+	fingerprintHash := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:fingerprint", userID, keysChangedAt)))
+	fingerprint := fingerprintHash[:16]
 
-	// kid format: "timestamp-fingerprint" where timestamp is milliseconds
-	syncKid := fmt.Sprintf("%d-%s", time.Now().UnixMilli(), base64URLEncode(fingerprint))
+	// kid format: "timestamp-fingerprint" where timestamp must match fxa-generation in JWT
+	// keysChangedAt is in seconds, which matches fxa-generation
+	syncKid := fmt.Sprintf("%d-%s", keysChangedAt, base64URLEncode(fingerprint))
 
 	// Create scoped keys payload - each key needs "scope" field matching the key name
 	scopedKeys := map[string]any{
